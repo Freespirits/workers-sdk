@@ -1,5 +1,6 @@
 export const CoreHeaders = {
-	CUSTOM_SERVICE: "MF-Custom-Service",
+	CUSTOM_FETCH_SERVICE: "MF-Custom-Fetch-Service",
+	CUSTOM_NODE_SERVICE: "MF-Custom-Node-Service",
 	ORIGINAL_URL: "MF-Original-URL",
 	PROXY_SHARED_SECRET: "MF-Proxy-Shared-Secret",
 	DISABLE_PRETTY_ERROR: "MF-Disable-Pretty-Error",
@@ -22,6 +23,7 @@ export const CoreBindings = {
 	SERVICE_USER_ROUTE_PREFIX: "MINIFLARE_USER_ROUTE_",
 	SERVICE_USER_FALLBACK: "MINIFLARE_USER_FALLBACK",
 	TEXT_CUSTOM_SERVICE: "MINIFLARE_CUSTOM_SERVICE",
+	IMAGES_SERVICE: "MINIFLARE_IMAGES_SERVICE",
 	TEXT_UPSTREAM_URL: "MINIFLARE_UPSTREAM_URL",
 	JSON_CF_BLOB: "CF_BLOB",
 	JSON_ROUTES: "MINIFLARE_ROUTES",
@@ -30,6 +32,9 @@ export const CoreBindings = {
 	DURABLE_OBJECT_NAMESPACE_PROXY: "MINIFLARE_PROXY",
 	DATA_PROXY_SECRET: "MINIFLARE_PROXY_SECRET",
 	DATA_PROXY_SHARED_SECRET: "MINIFLARE_PROXY_SHARED_SECRET",
+	TRIGGER_HANDLERS: "TRIGGER_HANDLERS",
+	LOG_REQUESTS: "LOG_REQUESTS",
+	STRIP_DISABLE_PRETTY_ERROR: "STRIP_DISABLE_PRETTY_ERROR",
 } as const;
 
 export const ProxyOps = {
@@ -82,4 +87,11 @@ export function isR2ObjectWriteHttpMetadata(targetName: string, key: string) {
 		(targetName === "HeadResult" || targetName === "GetResult") &&
 		key === "writeHttpMetadata"
 	);
+}
+
+/**
+ * See #createMediaProxy() comment for why this is special
+ */
+export function isImagesInput(targetName: string, key: string) {
+	return targetName === "ImagesBindingImpl" && key === "input";
 }

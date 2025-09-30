@@ -5,6 +5,15 @@ import type { Dispatcher } from "undici";
 
 const DECODER = new TextDecoder();
 
+/**
+ * Mutate an Error instance so it passes either of the checks in isAbortError
+ */
+export function castAsAbortError(err: Error): Error {
+	(err as Error & { code: string }).code = "ABORT_ERR";
+	err.name = "AbortError";
+	return err;
+}
+
 // See public facing `cloudflare:test` types for docs
 export const fetchMock = new MockAgent({ connections: 1 });
 
@@ -12,17 +21,29 @@ interface BufferedRequest {
 	request: Request;
 	body: Uint8Array | null;
 }
-const requests = new WeakMap<Dispatcher.DispatchOptions, BufferedRequest>();
-const responses = new WeakMap<Dispatcher.DispatchOptions, Response>();
 
+class SingleAccessMap<K, V> extends Map<K, V> {
+	override get(key: K): V | undefined {
+		const value = super.get(key);
+		super.delete(key);
+		return value;
+	}
+}
+
+const requests = new SingleAccessMap<string, BufferedRequest>();
+const responses = new SingleAccessMap<string, Response>();
+
+// This is in a Workers context
+// eslint-disable-next-line no-restricted-globals
 const originalFetch = fetch;
 setDispatcher((opts, handler) => {
-	const request = requests.get(opts);
+	const serialisedOptions = JSON.stringify(opts);
+	const request = requests.get(serialisedOptions);
 	assert(request !== undefined, "Expected dispatch to come from fetch()");
 	originalFetch
 		.call(globalThis, request.request, { body: request.body })
 		.then((response) => {
-			responses.set(opts, response);
+			responses.set(serialisedOptions, response);
 			assert(handler.onComplete !== undefined, "Expected onComplete() handler");
 			handler.onComplete?.([]);
 		})
@@ -37,13 +58,22 @@ setDispatcher((opts, handler) => {
 // worker. We kind of have to do it this way, as `fetchMock` supports functions
 // as reply callbacks, and we can't serialise arbitrary functions across worker
 // boundaries. For mocking requests in other workers, Miniflare's `fetchMock`
-// option can be used in the `vitest.config.ts`.
+// option can be used in the `vitest.config.mts`.
 globalThis.fetch = async (input, init) => {
 	const isActive = isMockActive(fetchMock);
-	if (!isActive) return originalFetch.call(globalThis, input, init);
+	if (!isActive) {
+		return originalFetch.call(globalThis, input, init);
+	}
 
 	const request = new Request(input, init);
 	const url = new URL(request.url);
+
+	// Use a signal and the aborted value if provided
+	const abortSignal = init?.signal;
+	let abortSignalAborted = abortSignal?.aborted ?? false;
+	abortSignal?.addEventListener("abort", () => {
+		abortSignalAborted = true;
+	});
 
 	// Don't allow mocked `Upgrade` requests
 	if (request.headers.get("Upgrade") !== null) {
@@ -75,13 +105,13 @@ globalThis.fetch = async (input, init) => {
 	const bodyText = bodyArray === null ? "" : DECODER.decode(bodyArray);
 	const dispatchOptions: Dispatcher.DispatchOptions = {
 		origin: url.origin,
-		path: url.pathname,
+		path: url.pathname + url.search,
 		method: request.method as Dispatcher.HttpMethod,
 		body: bodyText,
 		headers: requestHeaders,
-		query: Object.fromEntries(url.searchParams),
 	};
-	requests.set(dispatchOptions, { request, body: bodyArray });
+	const serialisedOptions = JSON.stringify(dispatchOptions);
+	requests.set(serialisedOptions, { request, body: bodyArray });
 
 	// If the response was mocked, record data as we receive it
 	let responseStatusCode: number | undefined;
@@ -98,8 +128,7 @@ globalThis.fetch = async (input, init) => {
 	});
 
 	// Dispatch the request through the mock agent
-	const dispatchHandlers: Dispatcher.DispatchHandlers = {
-		onConnect(_abort) {}, // (ignored)
+	const dispatchHandlers: Dispatcher.DispatchHandler = {
 		onError(error) {
 			responseReject(error);
 		},
@@ -108,10 +137,16 @@ globalThis.fetch = async (input, init) => {
 		},
 		// `onHeaders` and `onData` will only be called if the response was mocked
 		onHeaders(statusCode, headers, _resume, statusText) {
+			if (abortSignalAborted) {
+				return false;
+			}
+
 			responseStatusCode = statusCode;
 			responseStatusText = statusText;
 
-			if (headers === null) return true;
+			if (headers === null) {
+				return true;
+			}
 			assert.strictEqual(headers.length % 2, 0, "Expected key/value array");
 			responseHeaders = Array.from({ length: headers.length / 2 }).map(
 				(_, i) => [headers[i * 2].toString(), headers[i * 2 + 1].toString()]
@@ -119,12 +154,23 @@ globalThis.fetch = async (input, init) => {
 			return true;
 		},
 		onData(chunk) {
+			if (abortSignalAborted) {
+				return false;
+			}
+
 			responseChunks.push(chunk);
 			return true;
 		},
-		onComplete(_trailers) {
+		onComplete() {
+			if (abortSignalAborted) {
+				responseReject(
+					castAsAbortError(new Error("The operation was aborted"))
+				);
+				return;
+			}
+
 			// `maybeResponse` will be `undefined` if we mocked the request
-			const maybeResponse = responses.get(dispatchOptions);
+			const maybeResponse = responses.get(serialisedOptions);
 			if (maybeResponse === undefined) {
 				const responseBody = Buffer.concat(responseChunks);
 				const response = new Response(responseBody, {
@@ -132,12 +178,21 @@ globalThis.fetch = async (input, init) => {
 					statusText: responseStatusText,
 					headers: responseHeaders,
 				});
+				const throwImmutableHeadersError = () => {
+					throw new TypeError("Can't modify immutable headers");
+				};
+				Object.defineProperty(response, "url", { value: url.href });
+				Object.defineProperties(response.headers, {
+					set: { value: throwImmutableHeadersError },
+					append: { value: throwImmutableHeadersError },
+					delete: { value: throwImmutableHeadersError },
+				});
 				responseResolve(response);
 			} else {
 				responseResolve(maybeResponse);
 			}
 		},
-		onBodySent(_chunk) {}, // (ignored)
+		onBodySent() {}, // (ignored)
 	};
 
 	fetchMock.dispatch(dispatchOptions, dispatchHandlers);

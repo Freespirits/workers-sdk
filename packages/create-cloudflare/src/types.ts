@@ -7,14 +7,21 @@ export type C3Args = {
 	open?: boolean;
 	git?: boolean;
 	autoUpdate?: boolean;
-	// pages specific
+	category?: string;
+	// frameworks specific
 	framework?: string;
+	experimental?: boolean;
+	platform?: "pages" | "workers";
 	// workers specific
 	ts?: boolean;
+	lang?: string;
 	existingScript?: string;
 	template?: string;
+	templateMode?: "tar" | "git";
+	acceptDefaults?: boolean;
 	wranglerDefaults?: boolean;
 	additionalArgs?: string[];
+	help?: boolean;
 };
 export type C3Arg = C3Args[keyof C3Args];
 

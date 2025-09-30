@@ -1,5 +1,5 @@
 import { writeFileSync } from "fs";
-import { rest } from "msw";
+import { http, HttpResponse } from "msw";
 import {
 	deleteMTlsCertificate,
 	getMTlsCertificate,
@@ -8,6 +8,7 @@ import {
 	uploadMTlsCertificate,
 	uploadMTlsCertificateFromFs,
 } from "../api";
+import { COMPLIANCE_REGION_CONFIG_UNKNOWN } from "../environment-variables/misc-variables";
 import { mockAccountId, mockApiToken } from "./helpers/mock-account-id";
 import { mockConsoleMethods } from "./helpers/mock-console";
 import { mockConfirm } from "./helpers/mock-dialogs";
@@ -34,29 +35,28 @@ describe("wrangler", () => {
 	) {
 		const config = { calls: 0 };
 		msw.use(
-			rest.post(
+			http.post(
 				"*/accounts/:accountId/mtls_certificates",
-				async (request, response, context) => {
+				async ({ request }) => {
 					config.calls++;
 
-					const body = await request.json();
-					return response.once(
-						context.json({
-							success: true,
-							errors: [],
-							messages: [],
-							result: {
-								id: "1234",
-								name: body.name,
-								certificates: body.certificates,
-								issuer: "example.com...",
-								uploaded_on: now.toISOString(),
-								expires_on: oneYearLater.toISOString(),
-								...resp,
-							},
-						})
-					);
-				}
+					const body = (await request.json()) as Record<string, unknown>;
+					return HttpResponse.json({
+						success: true,
+						errors: [],
+						messages: [],
+						result: {
+							id: "1234",
+							name: body.name,
+							certificates: body.certificates,
+							issuer: "example.com...",
+							uploaded_on: now.toISOString(),
+							expires_on: oneYearLater.toISOString(),
+							...resp,
+						},
+					});
+				},
+				{ once: true }
 			)
 		);
 		return config;
@@ -67,40 +67,39 @@ describe("wrangler", () => {
 	) {
 		const config = { calls: 0 };
 		msw.use(
-			rest.get(
+			http.get(
 				"*/accounts/:accountId/mtls_certificates",
-				async (request, response, context) => {
+				async () => {
 					config.calls++;
 
-					return response.once(
-						context.json({
-							success: true,
-							errors: [],
-							messages: [],
-							result:
-								typeof certs === "undefined"
-									? [
-											{
-												id: "1234",
-												name: "cert one",
-												certificates: "BEGIN CERTIFICATE...",
-												issuer: "example.com...",
-												uploaded_on: now.toISOString(),
-												expires_on: oneYearLater.toISOString(),
-											},
-											{
-												id: "5678",
-												name: "cert two",
-												certificates: "BEGIN CERTIFICATE...",
-												issuer: "example.com...",
-												uploaded_on: now.toISOString(),
-												expires_on: oneYearLater.toISOString(),
-											},
-									  ]
-									: certs,
-						})
-					);
-				}
+					return HttpResponse.json({
+						success: true,
+						errors: [],
+						messages: [],
+						result:
+							typeof certs === "undefined"
+								? [
+										{
+											id: "1234",
+											name: "cert one",
+											certificates: "BEGIN CERTIFICATE...",
+											issuer: "example.com...",
+											uploaded_on: now.toISOString(),
+											expires_on: oneYearLater.toISOString(),
+										},
+										{
+											id: "5678",
+											name: "cert two",
+											certificates: "BEGIN CERTIFICATE...",
+											issuer: "example.com...",
+											uploaded_on: now.toISOString(),
+											expires_on: oneYearLater.toISOString(),
+										},
+									]
+								: certs,
+					});
+				},
+				{ once: true }
 			)
 		);
 		return config;
@@ -109,27 +108,26 @@ describe("wrangler", () => {
 	function mockGetMTlsCertificate(resp: Partial<MTlsCertificateResponse> = {}) {
 		const config = { calls: 0 };
 		msw.use(
-			rest.get(
+			http.get(
 				"*/accounts/:accountId/mtls_certificates/:certId",
-				async (request, response, context) => {
+				async () => {
 					config.calls++;
 
-					return response.once(
-						context.json({
-							success: true,
-							errors: [],
-							messages: [],
-							result: {
-								id: "1234",
-								certificates: "BEGIN CERTIFICATE...",
-								issuer: "example.com...",
-								uploaded_on: now.toISOString(),
-								expires_on: oneYearLater.toISOString(),
-								...resp,
-							},
-						})
-					);
-				}
+					return HttpResponse.json({
+						success: true,
+						errors: [],
+						messages: [],
+						result: {
+							id: "1234",
+							certificates: "BEGIN CERTIFICATE...",
+							issuer: "example.com...",
+							uploaded_on: now.toISOString(),
+							expires_on: oneYearLater.toISOString(),
+							...resp,
+						},
+					});
+				},
+				{ once: true }
 			)
 		);
 		return config;
@@ -138,20 +136,19 @@ describe("wrangler", () => {
 	function mockDeleteMTlsCertificate() {
 		const config = { calls: 0 };
 		msw.use(
-			rest.delete(
+			http.delete(
 				"*/accounts/:accountId/mtls_certificates/:certId",
-				async (request, response, context) => {
+				async () => {
 					config.calls++;
 
-					return response.once(
-						context.json({
-							success: true,
-							errors: [],
-							messages: [],
-							result: null,
-						})
-					);
-				}
+					return HttpResponse.json({
+						success: true,
+						errors: [],
+						messages: [],
+						result: null,
+					});
+				},
+				{ once: true }
 			)
 		);
 		return config;
@@ -172,11 +169,15 @@ describe("wrangler", () => {
 						expires_on: oneYearLater.toISOString(),
 					});
 
-					const cert = await uploadMTlsCertificate(accountId, {
-						certificateChain: "BEGIN CERTIFICATE...",
-						privateKey: "BEGIN PRIVATE KEY...",
-						name: "my_cert",
-					});
+					const cert = await uploadMTlsCertificate(
+						COMPLIANCE_REGION_CONFIG_UNKNOWN,
+						accountId,
+						{
+							certificateChain: "BEGIN CERTIFICATE...",
+							privateKey: "BEGIN PRIVATE KEY...",
+							name: "my_cert",
+						}
+					);
 
 					expect(cert.id).toEqual("1234");
 					expect(cert.issuer).toEqual("example.com...");
@@ -189,11 +190,15 @@ describe("wrangler", () => {
 			describe("uploadMTlsCertificateFromFs", () => {
 				it("should fail to read cert and key files when missing", async () => {
 					await expect(
-						uploadMTlsCertificateFromFs(accountId, {
-							certificateChainFilename: "cert.pem",
-							privateKeyFilename: "key.pem",
-							name: "my_cert",
-						})
+						uploadMTlsCertificateFromFs(
+							COMPLIANCE_REGION_CONFIG_UNKNOWN,
+							accountId,
+							{
+								certificateChainFilename: "cert.pem",
+								privateKeyFilename: "key.pem",
+								name: "my_cert",
+							}
+						)
 					).rejects.toMatchInlineSnapshot(
 						`[ParseError: Could not read file: cert.pem]`
 					);
@@ -208,11 +213,15 @@ describe("wrangler", () => {
 					writeFileSync("cert.pem", "BEGIN CERTIFICATE...");
 					writeFileSync("key.pem", "BEGIN PRIVATE KEY...");
 
-					const cert = await uploadMTlsCertificateFromFs(accountId, {
-						certificateChainFilename: "cert.pem",
-						privateKeyFilename: "key.pem",
-						name: "my_cert",
-					});
+					const cert = await uploadMTlsCertificateFromFs(
+						COMPLIANCE_REGION_CONFIG_UNKNOWN,
+						accountId,
+						{
+							certificateChainFilename: "cert.pem",
+							privateKeyFilename: "key.pem",
+							name: "my_cert",
+						}
+					);
 
 					expect(cert.id).toEqual("1234");
 					expect(cert.issuer).toEqual("example.com...");
@@ -243,7 +252,11 @@ describe("wrangler", () => {
 						},
 					]);
 
-					const certs = await listMTlsCertificates(accountId, {});
+					const certs = await listMTlsCertificates(
+						COMPLIANCE_REGION_CONFIG_UNKNOWN,
+						accountId,
+						{}
+					);
 
 					expect(certs).toHaveLength(2);
 
@@ -268,7 +281,11 @@ describe("wrangler", () => {
 						expires_on: oneYearLater.toISOString(),
 					});
 
-					const cert = await getMTlsCertificate(accountId, "1234");
+					const cert = await getMTlsCertificate(
+						COMPLIANCE_REGION_CONFIG_UNKNOWN,
+						accountId,
+						"1234"
+					);
 
 					expect(cert.id).toEqual("1234");
 					expect(cert.issuer).toEqual("example.com...");
@@ -291,7 +308,11 @@ describe("wrangler", () => {
 						},
 					]);
 
-					const cert = await getMTlsCertificateByName(accountId, "cert one");
+					const cert = await getMTlsCertificateByName(
+						COMPLIANCE_REGION_CONFIG_UNKNOWN,
+						accountId,
+						"cert one"
+					);
 
 					expect(cert.id).toEqual("1234");
 					expect(cert.issuer).toEqual("example.com...");
@@ -304,7 +325,11 @@ describe("wrangler", () => {
 					const mock = mockGetMTlsCertificates([]);
 
 					await expect(
-						getMTlsCertificateByName(accountId, "cert one")
+						getMTlsCertificateByName(
+							COMPLIANCE_REGION_CONFIG_UNKNOWN,
+							accountId,
+							"cert one"
+						)
 					).rejects.toMatchInlineSnapshot(
 						`[Error: certificate not found with name "cert one"]`
 					);
@@ -333,7 +358,11 @@ describe("wrangler", () => {
 					]);
 
 					await expect(
-						getMTlsCertificateByName(accountId, "cert one")
+						getMTlsCertificateByName(
+							COMPLIANCE_REGION_CONFIG_UNKNOWN,
+							accountId,
+							"cert one"
+						)
 					).rejects.toMatchInlineSnapshot(
 						`[Error: multiple certificates found with name "cert one"]`
 					);
@@ -346,7 +375,11 @@ describe("wrangler", () => {
 				test("calls delete mts_certificates endpoint", async () => {
 					const mock = mockDeleteMTlsCertificate();
 
-					await deleteMTlsCertificate(accountId, "1234");
+					await deleteMTlsCertificate(
+						COMPLIANCE_REGION_CONFIG_UNKNOWN,
+						accountId,
+						"1234"
+					);
 
 					expect(mock.calls).toEqual(1);
 				});
@@ -359,22 +392,23 @@ describe("wrangler", () => {
 					await runWrangler("mtls-certificate --help");
 					expect(std.err).toMatchInlineSnapshot(`""`);
 					expect(std.out).toMatchInlineSnapshot(`
-				"wrangler mtls-certificate
+						"wrangler mtls-certificate
 
-				🪪 Manage certificates used for mTLS connections
+						🪪 Manage certificates used for mTLS connections
 
-				Commands:
-				  wrangler mtls-certificate upload  Upload an mTLS certificate
-				  wrangler mtls-certificate list    List uploaded mTLS certificates
-				  wrangler mtls-certificate delete  Delete an mTLS certificate
+						COMMANDS
+						  wrangler mtls-certificate upload  Upload an mTLS certificate
+						  wrangler mtls-certificate list    List uploaded mTLS certificates
+						  wrangler mtls-certificate delete  Delete an mTLS certificate
 
-				Flags:
-				  -j, --experimental-json-config  Experimental: Support wrangler.json  [boolean]
-				  -c, --config                    Path to .toml configuration file  [string]
-				  -e, --env                       Environment to use for operations and .env files  [string]
-				  -h, --help                      Show help  [boolean]
-				  -v, --version                   Show version number  [boolean]"
-			`);
+						GLOBAL FLAGS
+						  -c, --config    Path to Wrangler configuration file  [string]
+						      --cwd       Run as if Wrangler was started in the specified directory instead of the current working directory  [string]
+						  -e, --env       Environment to use for operations, and for selecting .env and .dev.vars files  [string]
+						      --env-file  Path to an .env file to load - can be specified multiple times - values from earlier files are overridden by values in later files  [array]
+						  -h, --help      Show help  [boolean]
+						  -v, --version   Show version number  [boolean]"
+					`);
 				});
 			});
 

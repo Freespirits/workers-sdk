@@ -3,23 +3,22 @@ import { spinner } from "@cloudflare/cli/interactive";
 import { expect, vi } from "vitest";
 import whichPMRuns from "which-pm-runs";
 import type { Dirent } from "fs";
-import type { PmName } from "helpers/packageManagers";
 
-export const mockPackageManager = (name: PmName, version = "1.0.0") => {
+export const mockPackageManager = (name: string, version = "1.0.0") => {
 	if (!vi.isMockFunction(whichPMRuns)) {
 		expect.fail(
-			"When using `mockPackageManager` you must first call: vi.mock('which-pm-runs');"
+			"When using `mockPackageManager` you must first call: vi.mock('which-pm-runs');",
 		);
 	}
 	vi.mocked(whichPMRuns).mockReturnValue({ name, version });
 };
 
 export const mockWorkersTypesDirectory = (
-	mockImpl: () => string[] = () => [...mockWorkersTypesDirListing]
+	mockImpl: () => string[] = () => [...mockWorkersTypesDirListing],
 ) => {
 	if (!vi.isMockFunction(readdirSync)) {
 		expect.fail(
-			"When using `mockWorkersTypesDirectory` you must first call: vi.mock('fs');"
+			"When using `mockWorkersTypesDirectory` you must first call: vi.mock('fs');",
 		);
 	}
 	vi.mocked(readdirSync).mockImplementation((path) => {
@@ -34,7 +33,7 @@ export const mockWorkersTypesDirectory = (
 export const mockSpinner = () => {
 	if (!vi.isMockFunction(spinner)) {
 		expect.fail(
-			"When using `mockPackageManager` you must first call: vi.mock('@cloudflare/cli/interactive');"
+			"When using `mockPackageManager` you must first call: vi.mock('@cloudflare/cli/interactive');",
 		);
 	}
 

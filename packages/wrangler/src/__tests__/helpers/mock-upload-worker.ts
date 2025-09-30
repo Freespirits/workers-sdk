@@ -1,21 +1,28 @@
-import { Blob } from "node:buffer";
-import { MockedRequest, rest } from "msw";
-import { FormData } from "undici";
+import { http, HttpResponse } from "msw";
+import { ParseError } from "../../parse";
+import { getSubdomainValues } from "../../triggers/deploy";
+import { mockGetWorkerSubdomain } from "./mock-workers-subdomain";
 import { createFetchResult, msw } from "./msw";
-import { FileReaderSync } from "./msw/read-file-sync";
-import type { WorkerMetadata } from "../../deployment-bundle/create-worker-upload-form";
+import { serialize, toString } from "./serialize-form-data-entry";
+import { readWranglerConfig } from "./write-wrangler-config";
+import type { RawConfig, RawEnvironment } from "../../config";
+import type {
+	AssetConfigMetadata,
+	WorkerMetadata,
+} from "../../deployment-bundle/create-worker-upload-form";
 import type { CfWorkerInit } from "../../deployment-bundle/worker";
-import type { ResponseComposition, RestContext, RestRequest } from "msw";
+import type { NonVersionedScriptSettings } from "../../versions/api";
+import type { HttpResponseResolver } from "msw";
 
 /** Create a mock handler for the request to upload a worker script. */
 export function mockUploadWorkerRequest(
 	options: {
-		available_on_subdomain?: boolean;
-		expectedEntry?: string | RegExp;
+		expectedBaseUrl?: string;
+		expectedEntry?: string | RegExp | ((entry: string | null) => void);
 		expectedMainModule?: string;
-		expectedType?: "esm" | "sw";
+		expectedType?: "esm" | "sw" | "none";
 		expectedBindings?: unknown;
-		expectedModules?: Record<string, string>;
+		expectedModules?: Record<string, string | null>;
 		expectedCompatibilityDate?: string;
 		expectedCompatibilityFlags?: string[];
 		expectedMigrations?: CfWorkerInit["migrations"];
@@ -29,82 +36,48 @@ export function mockUploadWorkerRequest(
 		keepSecrets?: boolean;
 		tag?: string;
 		expectedDispatchNamespace?: string;
+		expectedScriptName?: string;
+		expectedAssets?: {
+			jwt: string;
+			config: AssetConfigMetadata;
+		};
+		useOldUploadApi?: boolean;
+		expectedObservability?: CfWorkerInit["observability"];
+		expectedSettingsPatch?: Partial<NonVersionedScriptSettings>;
+		expectedContainers?: { class_name: string }[];
 	} = {}
 ) {
-	const {
-		available_on_subdomain = true,
-		expectedEntry,
-		expectedMainModule = "index.js",
-		expectedType = "esm",
-		expectedBindings,
-		expectedModules = {},
-		expectedCompatibilityDate,
-		expectedCompatibilityFlags,
-		env = undefined,
-		legacyEnv = false,
-		expectedMigrations,
-		expectedTailConsumers,
-		expectedUnsafeMetaData,
-		expectedCapnpSchema,
-		expectedLimits,
-		keepVars,
-		keepSecrets,
-		expectedDispatchNamespace,
-	} = options;
-	if (env && !legacyEnv) {
-		msw.use(
-			rest.put(
-				"*/accounts/:accountId/workers/services/:scriptName/environments/:envName",
-				handleUpload
-			)
+	const handleUpload: HttpResponseResolver = async ({ params, request }) => {
+		const url = new URL(request.url);
+		expect(url.hostname).toMatch(
+			options.expectedBaseUrl ?? "api.cloudflare.com"
 		);
-	} else if (expectedDispatchNamespace) {
-		msw.use(
-			rest.put(
-				"*/accounts/:accountId/workers/dispatch/namespaces/:dispatchNamespace/scripts/:scriptName",
-				handleUpload
-			)
-		);
-	} else {
-		msw.use(
-			rest.put(
-				"*/accounts/:accountId/workers/scripts/:scriptName",
-				handleUpload
-			)
-		);
-	}
-
-	async function handleUpload(
-		req: RestRequest,
-		res: ResponseComposition,
-		ctx: RestContext
-	) {
-		expect(req.params.accountId).toEqual("some-account-id");
-		expect(req.params.scriptName).toEqual(
-			legacyEnv && env ? `test-name-${env}` : "test-name"
-		);
+		expect(params.accountId).toEqual("some-account-id");
+		expect(params.scriptName).toEqual(expectedScriptName);
 		if (!legacyEnv) {
-			expect(req.params.envName).toEqual(env);
+			expect(params.envName).toEqual(env);
 		}
-		expect(req.url.searchParams.get("include_subdomain_availability")).toEqual(
-			"true"
-		);
-		expect(req.url.searchParams.get("excludeScript")).toEqual("true");
+		if (useOldUploadApi) {
+			expect(url.searchParams.get("excludeScript")).toEqual("true");
+		}
 		if (expectedDispatchNamespace) {
-			expect(req.params.dispatchNamespace).toEqual(expectedDispatchNamespace);
+			expect(params.dispatchNamespace).toEqual(expectedDispatchNamespace);
 		}
 
-		const formBody = await (
-			req as MockedRequest as RestRequestWithFormData
-		).formData();
-		if (expectedEntry !== undefined) {
-			expect(formBody.get("index.js")).toMatch(expectedEntry);
+		const formBody = await request.formData();
+		if (typeof expectedEntry === "string" || expectedEntry instanceof RegExp) {
+			expect(await serialize(formBody.get("index.js"))).toMatch(expectedEntry);
+		} else if (typeof expectedEntry === "function") {
+			expectedEntry(await serialize(formBody.get("index.js")));
 		}
 		const metadata = JSON.parse(
-			formBody.get("metadata") as string
+			await toString(formBody.get("metadata"))
 		) as WorkerMetadata;
+
 		if (expectedType === "esm") {
 			expect(metadata.main_module).toEqual(expectedMainModule);
+		} else if (expectedType === "none") {
+			expect(metadata.main_module).toEqual(undefined);
 		} else {
 			expect(metadata.body_part).toEqual("index.js");
 		}
@@ -137,75 +110,162 @@ export function mockUploadWorkerRequest(
 			expect(metadata.tail_consumers).toEqual(expectedTailConsumers);
 		}
 		if ("expectedCapnpSchema" in options) {
-			expect(formBody.get(metadata.capnp_schema ?? "")).toEqual(
-				expectedCapnpSchema
-			);
+			expect(
+				await serialize(formBody.get(metadata.capnp_schema ?? ""))
+			).toEqual(expectedCapnpSchema);
 		}
 		if ("expectedLimits" in options) {
 			expect(metadata.limits).toEqual(expectedLimits);
 		}
+		if ("expectedAssets" in options) {
+			expect(metadata.assets).toEqual(expectedAssets);
+		}
+		if ("expectedObservability" in options) {
+			expect(metadata.observability).toEqual(expectedObservability);
+		}
+		if ("expectedContainers" in options) {
+			expect(metadata.containers).toEqual(expectedContainers);
+		}
+
 		if (expectedUnsafeMetaData !== undefined) {
 			Object.keys(expectedUnsafeMetaData).forEach((key) => {
 				expect(metadata[key]).toEqual(expectedUnsafeMetaData[key]);
 			});
 		}
 		for (const [name, content] of Object.entries(expectedModules)) {
-			expect(formBody.get(name)).toEqual(content);
+			expect(await serialize(formBody.get(name))).toEqual(content);
 		}
 
-		return res(
-			ctx.json(
+		if (useOldUploadApi) {
+			return HttpResponse.json(
 				createFetchResult({
-					available_on_subdomain,
 					id: "abc12345",
 					etag: "etag98765",
 					pipeline_hash: "hash9999",
 					mutable_pipeline_id: "mutableId",
 					tag: "sample-tag",
 					deployment_id: "Galaxy-Class",
+					startup_time_ms: 100,
 				})
+			);
+		}
+
+		return HttpResponse.json(
+			createFetchResult({
+				id: "Galaxy-Class",
+				startup_time_ms: 100,
+				resources: {
+					script: {
+						etag: "etag98765",
+					},
+				},
+			})
+		);
+	};
+
+	const {
+		expectedEntry,
+		expectedAssets,
+		// Allow setting expectedMainModule to undefined to test static-asset only uploads
+		expectedMainModule = expectedAssets
+			? options.expectedMainModule
+			: "index.js",
+		expectedType = "esm",
+		expectedBindings,
+		expectedModules = {},
+		expectedCompatibilityDate,
+		expectedCompatibilityFlags,
+		env = undefined,
+		legacyEnv = false,
+		expectedMigrations,
+		expectedTailConsumers,
+		expectedUnsafeMetaData,
+		expectedCapnpSchema,
+		expectedLimits,
+		expectedContainers,
+		keepVars,
+		keepSecrets,
+		expectedDispatchNamespace,
+		useOldUploadApi,
+		expectedObservability,
+		expectedSettingsPatch,
+	} = options;
+
+	const expectedScriptName =
+		options.expectedScriptName ??
+		"test-name" + (legacyEnv && env ? `-${env}` : "");
+
+	if (env && !legacyEnv) {
+		msw.use(
+			http.put(
+				"*/accounts/:accountId/workers/services/:scriptName/environments/:envName",
+				handleUpload
+			)
+		);
+	} else if (expectedDispatchNamespace) {
+		msw.use(
+			http.put(
+				"*/accounts/:accountId/workers/dispatch/namespaces/:dispatchNamespace/scripts/:scriptName",
+				handleUpload
+			)
+		);
+	} else if (useOldUploadApi) {
+		msw.use(
+			http.put(
+				"*/accounts/:accountId/workers/scripts/:scriptName",
+				handleUpload
+			)
+		);
+	} else {
+		msw.use(
+			http.post(
+				"*/accounts/:accountId/workers/scripts/:scriptName/versions",
+				handleUpload
+			),
+			http.post(
+				"*/accounts/:accountId/workers/scripts/:scriptName/deployments",
+				() => HttpResponse.json(createFetchResult({ id: "Deployment-ID" }))
+			),
+			http.patch(
+				"*/accounts/:accountId/workers/scripts/:scriptName/script-settings",
+				async ({ request }) => {
+					const body = await request.json();
+
+					if ("expectedSettingsPatch" in options) {
+						expect(body).toEqual(expectedSettingsPatch);
+					}
+
+					return HttpResponse.json(createFetchResult({}));
+				}
 			)
 		);
 	}
-}
-
-// MSW FormData & Blob polyfills to test FormData requests
-function mockFormDataToString(this: FormData) {
-	const entries = [];
-	for (const [key, value] of this.entries()) {
-		if (value instanceof Blob) {
-			const reader = new FileReaderSync();
-			reader.readAsText(value);
-			const result = reader.result;
-			entries.push([key, result]);
+	// Every upload is followed by a GET subdomain request, to check if the worker is enabled.
+	// TODO: make this explicit by callers?
+	let config: RawConfig = {};
+	try {
+		config = readWranglerConfig();
+	} catch (e) {
+		if (e instanceof ParseError) {
+			// Ignore, config is either bad or doesn't exist.
 		} else {
-			entries.push([key, value]);
+			throw e;
 		}
 	}
-	return JSON.stringify({
-		__formdata: entries,
+	let envConfig: RawEnvironment = config;
+	if (env) {
+		envConfig = config.env?.[env] ?? {};
+	}
+	const { workers_dev, preview_urls } = getSubdomainValues(
+		envConfig.workers_dev,
+		envConfig.preview_urls,
+		envConfig.routes ?? []
+	);
+	mockGetWorkerSubdomain({
+		enabled: workers_dev,
+		previews_enabled: preview_urls,
+		env,
+		legacyEnv,
+		expectedScriptName,
 	});
 }
-
-async function mockFormDataFromString(this: MockedRequest): Promise<FormData> {
-	const { __formdata } = await this.json();
-	expect(__formdata).toBeInstanceOf(Array);
-
-	const form = new FormData();
-	for (const [key, value] of __formdata) {
-		form.set(key, value);
-	}
-	return form;
-}
-
-// The following two functions workaround the fact that MSW does not yet support FormData in requests.
-// We use the fact that MSW relies upon `node-fetch` internally, which will call `toString()` on the FormData object,
-// rather than passing it through or serializing it as a proper FormData object.
-// The hack is to serialize FormData to a JSON string by overriding `FormData.toString()`.
-// And then to deserialize back to a FormData object by monkey-patching a `formData()` helper onto `MockedRequest`.
-FormData.prototype.toString = mockFormDataToString;
-export interface RestRequestWithFormData extends MockedRequest, RestRequest {
-	formData(): Promise<FormData>;
-}
-(MockedRequest.prototype as RestRequestWithFormData).formData =
-	mockFormDataFromString;

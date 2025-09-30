@@ -1,6 +1,6 @@
 {
-	"name": "turbo-r2-archive",
-	"version": "0.0.0",
+	"name": "@cloudflare/turbo-r2-archive",
+	"version": "0.0.4",
 	"private": true,
 	"description": "TurboRepo API Compliant Remote Caching w/ Cloudflare Workers using R2",
 	"keywords": [
@@ -11,18 +11,25 @@
 		"remote cache"
 	],
 	"scripts": {
-		"build": "wrangler deploy -j --dry-run --outdir=./dist",
-		"deploy": "wrangler deploy -j",
-		"start": "wrangler dev -j",
-		"type:check": "tsc --noEmit"
+		"build": "wrangler deploy --dry-run --outdir=./dist",
+		"check:lint": "eslint .  --max-warnings=0",
+		"deploy": "wrangler deploy",
+		"start": "wrangler dev",
+		"type:check": "tsc"
 	},
 	"dependencies": {
-		"@hono/zod-validator": "^0.1.8",
-		"hono": "^3.5.6",
+		"@hono/zod-validator": "^0.4.2",
+		"hono": "^4.7.0",
 		"zod": "^3.22.3"
 	},
 	"devDependencies": {
 		"@cloudflare/workers-tsconfig": "workspace:*",
 		"wrangler": "workspace:*"
+	},
+	"volta": {
+		"extends": "../../package.json"
+	},
+	"workers-sdk": {
+		"deploy": true
 	}
 }

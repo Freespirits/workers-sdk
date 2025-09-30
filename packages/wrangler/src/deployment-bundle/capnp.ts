@@ -20,14 +20,19 @@ export function handleUnsafeCapnp(capnp: CfCapnp): Buffer {
 		);
 	}
 	const srcPrefix = resolve(base_path ?? ".");
-	const capnpProcess = spawnSync("capnp", [
-		"compile",
-		"-o-",
-		`--src-prefix=${srcPrefix}`,
-		...capnpSchemas,
-	]);
-	if (capnpProcess.error) throw capnpProcess.error;
-	if (capnpProcess.stderr.length)
+	const capnpProcess = spawnSync(
+		"capnp",
+		["compile", "-o-", `--src-prefix=${srcPrefix}`, ...capnpSchemas],
+		// This number was chosen arbitrarily. If you get ENOBUFS because your compiled schema is still
+		// too large, then we may need to bump this again or figure out another approach.
+		// https://github.com/cloudflare/workers-sdk/pull/10217
+		{ maxBuffer: 3 * 1024 * 1024 }
+	);
+	if (capnpProcess.error) {
+		throw capnpProcess.error;
+	}
+	if (capnpProcess.stderr.length) {
 		throw new Error(capnpProcess.stderr.toString());
+	}
 	return capnpProcess.stdout;
 }

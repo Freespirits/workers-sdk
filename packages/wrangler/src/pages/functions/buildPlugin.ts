@@ -17,19 +17,24 @@ export function buildPluginFromFunctions({
 	routesModule,
 	outdir,
 	minify = false,
+	keepNames = true,
 	sourcemap = false,
 	watch = false,
 	onEnd = () => {},
-	legacyNodeCompat,
+	nodejsCompatMode,
 	functionsDirectory,
 	local,
 	defineNavigatorUserAgent,
+	checkFetch,
+	external,
 }: Options) {
 	const entry: Entry = {
 		file: resolve(getBasePath(), "templates/pages-template-plugin.ts"),
-		directory: functionsDirectory,
+		projectRoot: functionsDirectory,
+		configPath: undefined,
 		format: "modules",
 		moduleRoot: functionsDirectory,
+		exports: [],
 	};
 	const moduleCollector = createModuleCollector({
 		entry,
@@ -42,15 +47,20 @@ export function buildPluginFromFunctions({
 		inject: [routesModule],
 		entryName: "index",
 		minify,
+		keepNames,
 		sourcemap,
 		watch,
-		legacyNodeCompat,
 		// We don't currently have a mechanism for Plugins 'requiring' a specific compat date/flag,
 		// but if someone wants to publish a Plugin which does require this new `nodejs_compat` flag
 		// and they document that on their README.md, we should let them.
-		nodejsCompat: true,
+		nodejsCompatMode: nodejsCompatMode ?? "v1",
+		compatibilityDate: undefined,
+		compatibilityFlags: undefined,
 		define: {},
+		alias: {},
 		doBindings: [], // Pages functions don't support internal Durable Objects
+		workflowBindings: [], // Pages functions don't support internal Workflows
+		external,
 		plugins: [
 			buildNotifierPlugin(onEnd),
 			{
@@ -102,12 +112,17 @@ export function buildPluginFromFunctions({
 				},
 			},
 		],
-		serveAssetsFromWorker: false,
-		checkFetch: local,
+		checkFetch: local && checkFetch,
 		targetConsumer: local ? "dev" : "deploy",
-		forPages: true,
 		local,
 		projectRoot: getPagesProjectRoot(),
 		defineNavigatorUserAgent,
+
+		jsxFactory: undefined,
+		jsxFragment: undefined,
+		tsconfig: undefined,
+		testScheduled: undefined,
+		isOutfile: undefined,
+		metafile: undefined,
 	});
 }

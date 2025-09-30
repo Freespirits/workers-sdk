@@ -19,21 +19,19 @@
 		"rootDir": ".",
 		"checkJs": true,
 		"allowJs": true,
-		"skipLibCheck": false,
+		"skipLibCheck": true,
 		"paths": {
 			"miniflare": ["./src"],
 			"miniflare:shared": ["./src/workers/shared/index.ts"],
 			"miniflare:zod": ["./src/workers/shared/zod.worker.ts"]
 		}
 	},
+	"files": ["test/fixtures/unsafe-plugin/index.ts"],
 	"include": [
 		"src/**/*.ts",
 		"test/**/*.ts",
-		"types"
+		"types",
+		"test/fixtures/unsafe-plugin/**/*.ts"
 	],
-	"exclude": [
-		"src/workers/**/*.worker.ts",
-		"src/workers/node.d.ts",
-		"test/fixtures"
-	]
+	"exclude": ["src/workers/**/*.ts", "src/workers/node.d.ts", "test/fixtures"]
 }

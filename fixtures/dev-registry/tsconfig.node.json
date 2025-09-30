@@ -1,0 +1,9 @@
+{
+	"extends": ["@cloudflare/workers-tsconfig/base.json"],
+	"include": [
+		"vite.module-worker.config.ts",
+		"vite.worker-entrypoint.config.ts",
+		"vite.worker-entrypoint-with-assets.config.ts",
+		"__tests__"
+	]
+}

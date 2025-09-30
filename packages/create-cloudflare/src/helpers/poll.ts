@@ -22,19 +22,21 @@ export const poll = async (url: string): Promise<boolean> => {
 	const domain = new URL(url).host;
 	const s = spinner();
 
-	s.start("Waiting for DNS to propagate");
+	s.start("Waiting for DNS to propagate. This might take a few minutes.");
 
 	// Start out by sleeping for 10 seconds since it's unlikely DNS changes will
 	// have propogated before then
 	await sleep(10 * 1000);
 
 	await pollDns(domain, start, s);
-	if (await pollHttp(url, start, s)) return true;
+	if (await pollHttp(url, start, s)) {
+		return true;
+	}
 
 	s.stop(
 		`${brandColor(
-			"timed out"
-		)} while waiting for ${url} - try accessing it in a few minutes.`
+			"timed out",
+		)} while waiting for ${url} - try accessing it in a few minutes.`,
 	);
 	return false;
 };
@@ -42,10 +44,12 @@ export const poll = async (url: string): Promise<boolean> => {
 const pollDns = async (
 	domain: string,
 	start: number,
-	s: ReturnType<typeof spinner>
+	s: ReturnType<typeof spinner>,
 ) => {
 	while (Date.now() - start < TIMEOUT) {
-		s.update(`Waiting for DNS to propagate (${secondsSince(start)}s)`);
+		s.update(
+			`Waiting for DNS to propagate. This might take a few minutes. (${secondsSince(start)}s)`,
+		);
 		if (await isDomainResolvable(domain)) {
 			s.stop(`${brandColor("DNS propagation")} ${dim("complete")}.`);
 			return;
@@ -57,12 +61,12 @@ const pollDns = async (
 const pollHttp = async (
 	url: string,
 	start: number,
-	s: ReturnType<typeof spinner>
+	s: ReturnType<typeof spinner>,
 ) => {
 	s.start("Waiting for deployment to become available");
 	while (Date.now() - start < TIMEOUT) {
 		s.update(
-			`Waiting for deployment to become available (${secondsSince(start)}s)`
+			`Waiting for deployment to become available (${secondsSince(start)}s)`,
 		);
 		try {
 			const { statusCode } = await request(url, {
@@ -71,7 +75,7 @@ const pollHttp = async (
 			});
 			if (statusCode === 200) {
 				s.stop(
-					`${brandColor("deployment")} ${dim("is ready at:")} ${blue(url)}`
+					`${brandColor("deployment")} ${dim("is ready at:")} ${blue(url)}`,
 				);
 				return true;
 			}
@@ -92,13 +96,15 @@ export const isDomainResolvable = async (domain: string) => {
 		const nameServers = await lookupSubdomainNameservers(domain);
 
 		// If the subdomain nameservers aren't resolvable yet, keep polling
-		if (nameServers.length === 0) return false;
+		if (nameServers.length === 0) {
+			return false;
+		}
 
 		// Once they are resolvable, query these nameservers for the domain's 'A' record
 		const dns = new dns2({ nameServers });
 		const res = await dns.resolve(domain, "A");
 		return res.answers.length > 0;
-	} catch (error) {
+	} catch {
 		return false;
 	}
 };

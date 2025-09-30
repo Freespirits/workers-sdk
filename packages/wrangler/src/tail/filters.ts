@@ -2,7 +2,7 @@
  * When tailing logs from a worker, oftentimes you don't want to see _every
  * single event_. That's where filters come in. We can send a set of filters
  * to the tail worker, and it will pre-filter any logs for us so that we
- * only recieve the ones we care about.
+ * only receive the ones we care about.
  */
 
 import { UserError } from "../errors";
@@ -10,7 +10,7 @@ import { UserError } from "../errors";
 /**
  * These are the filters we accept in the CLI. They
  * were copied directly from Wrangler v1 in order to
- * maintain compatability, so they aren't actually the exact
+ * maintain compatibility, so they aren't actually the exact
  * filters we need to send up to the tail worker. They generally map 1:1,
  * but often require some transformation or
  * renaming to match what it expects.
@@ -25,6 +25,7 @@ export type TailCLIFilters = {
 	search?: string;
 	samplingRate?: number;
 	clientIp?: string[];
+	versionId?: string;
 };
 
 /**
@@ -40,7 +41,8 @@ export type TailAPIFilter =
 	| MethodFilter
 	| HeaderFilter
 	| ClientIPFilter
-	| QueryFilter;
+	| QueryFilter
+	| ScriptVersionFilter;
 
 /**
  * Filters logs based on a given sampling rate.
@@ -119,6 +121,14 @@ type QueryFilter = {
 };
 
 /**
+ * Filters logs by a version id. All logs must originate from a
+ * worker with a matching version id.
+ */
+type ScriptVersionFilter = {
+	scriptVersion: string;
+};
+
+/**
  * The full message we send to the tail worker includes our
  * filters and a debug flag.
  */
@@ -160,6 +170,10 @@ export function translateCLICommandToFilterMessage(
 
 	if (cliFilters.search) {
 		apiFilters.push(parseQuery(cliFilters.search));
+	}
+
+	if (cliFilters.versionId) {
+		apiFilters.push(parseScriptVersion(cliFilters.versionId));
 	}
 
 	return {
@@ -276,4 +290,16 @@ function parseIP(client_ip: string[]): ClientIPFilter {
  */
 function parseQuery(query: string): QueryFilter {
 	return { query };
+}
+
+/**
+ * Users can filter for logs that were emitted from a Worker with a
+ * specific version. This is especially useful when debugging an issue
+ * that only happens in one branch of a gradual rollout.
+ *
+ * @param scriptVersion the id of the version that a log must match.
+ * @returns a ScriptVersionFilter for use with the API
+ */
+function parseScriptVersion(scriptVersion: string): ScriptVersionFilter {
+	return { scriptVersion };
 }

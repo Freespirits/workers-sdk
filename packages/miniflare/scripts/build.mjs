@@ -51,6 +51,15 @@ const miniflareZodExtensionPath = path.join(
 	"shared",
 	"zod.worker.ts"
 );
+
+/**
+ * An array of folders in `test/fixtures` that require transpilation
+ * via ESBuild
+ */
+const fixtureBuilds = [
+	path.join(pkgRoot, "test/fixtures/unsafe-plugin/index.ts"),
+];
+
 /**
  * `workerd` `extensions` don't have access to "built-in" modules like
  * `node:buffer`, but do have access to "internal" modules like
@@ -95,16 +104,15 @@ const embedWorkersPlugin = {
 		build.onLoad({ filter: /.*/, namespace }, async (args) => {
 			let builder = workersBuilders.get(args.path);
 			if (builder === undefined) {
-				builder = await esbuild.build({
+				builder = await esbuild.context({
 					platform: "node", // Marks `node:*` imports as external
 					format: "esm",
 					target: "esnext",
 					bundle: true,
 					sourcemap: true,
 					sourcesContent: false,
-					external: ["miniflare:shared", "miniflare:zod"],
+					external: ["miniflare:shared", "miniflare:zod", "cloudflare:workers"],
 					metafile: true,
-					incremental: watch, // Allow `rebuild()` calls if watching
 					entryPoints: [args.path],
 					minifySyntax: true,
 					outdir: build.initialOptions.outdir,
@@ -115,9 +123,8 @@ const embedWorkersPlugin = {
 							? [rewriteNodeToInternalPlugin]
 							: [],
 				});
-			} else {
-				builder = await builder.rebuild();
 			}
+			const metafile = (await builder.rebuild()).metafile;
 			workersBuilders.set(args.path, builder);
 			await fs.mkdir("worker-metafiles", { recursive: true });
 			await fs.writeFile(
@@ -125,12 +132,12 @@ const embedWorkersPlugin = {
 					"worker-metafiles",
 					path.basename(args.path) + ".metafile.json"
 				),
-				JSON.stringify(builder.metafile)
+				JSON.stringify(metafile)
 			);
 			let outPath = args.path.substring(workersRoot.length + 1);
 			outPath = outPath.substring(0, outPath.lastIndexOf(".")) + ".js";
 			outPath = JSON.stringify(outPath);
-			const watchFiles = Object.keys(builder.metafile.inputs);
+			const watchFiles = Object.keys(metafile.inputs);
 			const contents = `
       import fs from "fs";
       import path from "path";
@@ -143,6 +150,9 @@ const embedWorkersPlugin = {
          return contents;
       }
       `;
+			if (!watch) {
+				builder.dispose();
+			}
 			return { contents, loader: "js", watchFiles };
 		});
 	},
@@ -152,6 +162,14 @@ async function buildPackage() {
 	const pkg = getPackage(pkgRoot);
 
 	const indexPath = path.join(pkgRoot, "src", "index.ts");
+	// The dev registry proxy runs in a Node.js worker thread (instead of workerd) and
+	// requires a separate entry file
+	const devRegistryProxyPath = path.join(
+		pkgRoot,
+		"src",
+		"shared",
+		"dev-registry.worker.ts"
+	);
 	// Look for test files ending with .spec.ts in the test directory, default to
 	// empty array if not found
 	let testPaths = [];
@@ -162,9 +180,11 @@ async function buildPackage() {
 	} catch (e) {
 		if (e.code !== "ENOENT") throw e;
 	}
+	// Add any test fixtures that require transpilation via ESBuild
+	testPaths.push(...fixtureBuilds);
 	const outPath = path.join(pkgRoot, "dist");
 
-	await esbuild.build({
+	const buildOptions = {
 		platform: "node",
 		format: "cjs",
 		target: "esnext",
@@ -187,11 +207,19 @@ async function buildPackage() {
 		],
 		plugins: [embedWorkersPlugin],
 		logLevel: watch ? "info" : "warning",
-		watch,
 		outdir: outPath,
 		outbase: pkgRoot,
-		entryPoints: [indexPath, ...testPaths],
-	});
+		entryPoints: [indexPath, devRegistryProxyPath, ...testPaths],
+	};
+	if (watch) {
+		const ctx = await esbuild.context(buildOptions);
+		await ctx.watch();
+	} else {
+		await esbuild.build(buildOptions);
+	}
 }
 
-await buildPackage();
+buildPackage().catch((e) => {
+	console.error("Failed to build miniflare", e);
+	process.exit(1);
+});

@@ -20,6 +20,9 @@ export enum ApiErrorCodes {
 export const EXIT_CODE_FUNCTIONS_NO_ROUTES_ERROR = 156;
 export const EXIT_CODE_FUNCTIONS_NOTHING_TO_BUILD_ERROR = 157;
 
+export const EXIT_CODE_NO_CONFIG_FOUND = 158;
+export const EXIT_CODE_INVALID_PAGES_CONFIG = 159;
+
 /**
  * Pages error when building a script from the functions directory fails
  */
@@ -27,18 +30,6 @@ export class FunctionsBuildError extends UserError {
 	constructor(message: string) {
 		super(message);
 	}
-}
-
-/**
- * Warning message for when buildFunctions throws FunctionsBuildError
- */
-export function getFunctionsBuildWarning(
-	functionsDirectory: string,
-	suffix?: string
-) {
-	return `Unexpected error building Functions directory: ${functionsDirectory}${
-		suffix ? " - " + suffix : ""
-	}`;
 }
 
 /**

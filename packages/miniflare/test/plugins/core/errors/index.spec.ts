@@ -5,10 +5,10 @@ import { fileURLToPath, pathToFileURL } from "url";
 import test from "ava";
 import Protocol from "devtools-protocol";
 import esbuild from "esbuild";
-import { DeferredPromise, Log, LogLevel, Miniflare, fetch } from "miniflare";
-import type { RawSourceMap } from "source-map";
+import { DeferredPromise, fetch, Log, LogLevel, Miniflare } from "miniflare";
 import NodeWebSocket from "ws";
 import { escapeRegexpComponent, useTmp } from "../../../test-shared";
+import type { RawSourceMap } from "source-map";
 
 const FIXTURES_PATH = path.resolve(
 	__dirname,
@@ -244,7 +244,11 @@ function getSourceMapURL(
 				if (params.sourceMapURL === undefined || params.sourceMapURL === "") {
 					return;
 				}
-				sourceMapURL = new URL(params.sourceMapURL, params.url).toString();
+				// If sourceMapURL is relative
+				sourceMapURL = new URL(
+					params.sourceMapURL,
+					!params.url.startsWith("script-") ? params.url : undefined
+				).toString();
 				ws.close();
 			}
 		} catch (e) {
@@ -277,33 +281,78 @@ async function getSources(inspectorBaseURL: URL, serviceName: string) {
 		.sort();
 }
 
-// TODO(soon): just use `NoOpLog` when `Log#error()` no longer throws
-class SafeLog extends Log {
-	error(message: Error) {
-		this.logWithLevel(LogLevel.ERROR, String(message));
+class CustomLog extends Log {
+	logs: [LogLevel, string][] = [];
+
+	log(message: string): void {
+		this.logs.push([LogLevel.NONE, message]);
+	}
+
+	logWithLevel(level: LogLevel, message: string) {
+		this.logs.push([level, message]);
+	}
+
+	getLogs(level: LogLevel): string[] {
+		return this.logs
+			.filter(([logLevel]) => logLevel === level)
+			.map(([, message]) => message);
 	}
 }
 
 test("responds with pretty error page", async (t) => {
+	const log = new CustomLog();
 	const mf = new Miniflare({
-		log: new SafeLog(LogLevel.NONE),
+		log,
 		modules: true,
 		script: `
+		import { connect } from "cloudflare:sockets";
+
+		// A function to test error thrown by native code
+		async function connectSocket(request) {
+			try {
+				// The following line will throw an error because the port is invalid
+				const socket = connect({ hostname: "gopher.floodgap.com", port: "invalid" });
+
+				const writer = socket.writable.getWriter();
+				const url = new URL(request.url);
+				const encoder = new TextEncoder();
+				const encoded = encoder.encode(url.pathname + "\\r\\n");
+				await writer.write(encoded);
+				await writer.close();
+
+				return new Response(socket.readable, {
+					headers: { "Content-Type": "text/plain" },
+				});
+			} catch (e) {
+				throw new Error("Unusual oops!", {
+					cause: e,
+				});
+			}
+		}
+
+		// This emulates the reduceError function in the Wrangler middleware template
+		// See packages/wrangler/templates/middleware/middleware-miniflare3-json-error.ts
 		function reduceError(e) {
 			return {
 				name: e?.name,
 				message: e?.message ?? String(e),
 				stack: e?.stack,
+				cause: e?.cause === undefined ? undefined : reduceError(e.cause),
 			};
 		}
+
 		export default {
-			async fetch() {
-				const error = reduceError(new Error("Unusual oops!"));
-				return Response.json(error, {
-					status: 500,
-					headers: { "MF-Experimental-Error-Stack": "true" },
-				});
-			}
+			async fetch(request) {
+				try {
+					return await connectSocket(request);
+				} catch (e) {
+					const error = reduceError(e);
+					return Response.json(error, {
+						status: 500,
+						headers: { "MF-Experimental-Error-Stack": "true" },
+					});
+				}
+			},
 		}`,
 	});
 	t.teardown(() => mf.dispose());
@@ -319,9 +368,28 @@ test("responds with pretty error page", async (t) => {
 	const text = await res.text();
 	// ...including error, request method, URL and headers
 	t.regex(text, /Unusual oops!/);
-	t.regex(text, /Method.+POST/s);
-	t.regex(text, /URI.+some-unusual-path/s);
+	t.regex(text, /Method.+POST/is);
+	t.regex(text, /URL.+some-unusual-path/is);
 	t.regex(text, /X-Unusual-Key.+some-unusual-value/is);
+	// Check if the stack trace is included
+	t.regex(text, /cloudflare\:sockets/);
+	t.regex(text, /connectSocket/);
+	t.regex(text, /connect/);
+	t.regex(text, /Object\.fetch/);
+
+	// Check error logged
+	const errorLogs = log
+		.getLogs(LogLevel.ERROR)
+		.map((log) => log.replaceAll(/:\d+:\d+/g, ":N:N"));
+	t.deepEqual(errorLogs, [
+		`Error: Unusual oops!
+    at connectSocket (script-0:N:N)
+    at Object.fetch (script-0:N:N)
+Caused by: TypeError: The value cannot be converted because it is not an integer.
+    at connect (cloudflare:sockets:N:N)
+    at connectSocket (script-0:N:N)
+    at Object.fetch (script-0:N:N)`,
+	]);
 
 	// Check `fetch()` accepting HTML returns pretty-error page
 	res = await fetch(url, { headers: { Accept: "text/html" } });

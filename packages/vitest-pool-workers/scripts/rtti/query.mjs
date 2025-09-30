@@ -1,7 +1,6 @@
-import assert from "node:assert";
-import { Message } from "capnp-ts";
+import { Message } from "capnp-es";
 import { Miniflare } from "miniflare";
-import { StructureGroups } from "./rtti.capnp.js";
+import { StructureGroups } from "./rtti.js";
 
 // Extract RTTI from `workerd`
 const mf = new Miniflare({
@@ -24,37 +23,19 @@ await mf.dispose();
 
 // Parse RTTI
 const message = new Message(buffer, /* packed */ false);
+
 const root = message.getRoot(StructureGroups);
 const structures = new Map();
-root.getGroups().forEach((group) => {
-	group.getStructures().forEach((structure) => {
-		structures.set(structure.getFullyQualifiedName(), structure);
+root.groups.forEach((group) => {
+	group.structures.forEach((structure) => {
+		structures.set(structure.fullyQualifiedName, structure);
 	});
 });
 
-// Get `ExportedHandler` property names
-const exportedHandler = structures.get("workerd::api::ExportedHandler");
-assert(exportedHandler !== undefined, "Expected to find ExportedHandler types");
-const exportedHandlerNames = new Set();
-// Add names from the C++ type
-exportedHandler.getMembers().forEach((member) => {
-	if (!member.isProperty()) return;
-	const property = member.getProperty();
-	if (property.getType().isJsgImpl()) return;
-	exportedHandlerNames.add(property.getName());
-});
-// Add names from the TypeScript override. This will catch things like `email`
-// and `queue` which are "custom events" defined dynamically.
-for (const match of exportedHandler.getTsOverride().matchAll(/([a-z]+)\?:/g)) {
-	exportedHandlerNames.add(match[1]);
-}
-/** @type {string[]} */
-export const exportedHandlers = Array.from(exportedHandlerNames);
-
 // Get built-in modules list
 const builtinModuleNames = new Set();
-root.getModules().forEach((module) => {
-	builtinModuleNames.add(module.getSpecifier());
+root.modules.forEach((module) => {
+	builtinModuleNames.add(module.specifier);
 });
 // TODO(soon): remove this line once `exportTypes()` supports compatibility
 //  flags that require `--experimental` (e.g. "unsafe_module")

@@ -1,21 +1,17 @@
 import chalk from "chalk";
 import prompts from "prompts";
 import { UserError } from "./errors";
-import { CI } from "./is-ci";
-import isInteractive from "./is-interactive";
+import { isNonInteractiveOrCI } from "./is-interactive";
 import { logger } from "./logger";
-
-// TODO: Use this function across the codebase.
-function isNonInteractiveOrCI(): boolean {
-	return !isInteractive() || CI.isCI();
-}
 
 export class NoDefaultValueProvided extends UserError {
 	constructor() {
 		// This is user-facing, so make the message something understandable
 		// It _should_ always be caught and replaced with a more descriptive error
 		// but this is fine as a fallback.
-		super("This command cannot be run in a non-interactive context");
+		super("This command cannot be run in a non-interactive context", {
+			telemetryMessage: true,
+		});
 		Object.setPrototypeOf(this, new.target.prototype);
 	}
 }
@@ -95,6 +91,7 @@ export async function prompt(
 interface SelectOptions<Values> {
 	choices: SelectOption<Values>[];
 	defaultOption?: number;
+	fallbackOption?: number;
 }
 
 interface SelectOption<Values> {
@@ -108,16 +105,16 @@ export async function select<Values extends string>(
 	options: SelectOptions<Values>
 ): Promise<Values> {
 	if (isNonInteractiveOrCI()) {
-		if (options?.defaultOption === undefined) {
+		if (options.fallbackOption === undefined) {
 			throw new NoDefaultValueProvided();
 		}
 		logger.log(`? ${text}`);
 		logger.log(
 			`🤖 ${chalk.dim(
-				"Using default value in non-interactive context:"
-			)} ${chalk.white.bold(options.choices[options.defaultOption].title)}`
+				"Using fallback value in non-interactive context:"
+			)} ${chalk.white.bold(options.choices[options.fallbackOption].title)}`
 		);
-		return options.choices[options.defaultOption].value;
+		return options.choices[options.fallbackOption].value;
 	}
 
 	const { value } = await prompts({
@@ -126,6 +123,50 @@ export async function select<Values extends string>(
 		message: text,
 		choices: options.choices,
 		initial: options.defaultOption,
+		onState: (state) => {
+			if (state.aborted) {
+				process.nextTick(() => {
+					process.exit(1);
+				});
+			}
+		},
+	});
+	return value;
+}
+
+interface MultiSelectOptions<Values> {
+	choices: SelectOption<Values>[];
+	defaultOptions?: number[];
+}
+
+export async function multiselect<Values extends string>(
+	text: string,
+	options: MultiSelectOptions<Values>
+): Promise<Values[]> {
+	if (isNonInteractiveOrCI()) {
+		if (options?.defaultOptions === undefined) {
+			throw new NoDefaultValueProvided();
+		}
+
+		const defaultTitles = options.defaultOptions.map(
+			(index) => options.choices[index].title
+		);
+		logger.log(`? ${text}`);
+
+		logger.log(
+			`🤖 ${chalk.dim(
+				"Using default value(s) in non-interactive context:"
+			)} ${chalk.white.bold(defaultTitles.join(", "))}`
+		);
+		return options.defaultOptions.map((index) => options.choices[index].value);
+	}
+	const { value } = await prompts({
+		type: "multiselect",
+		name: "value",
+		message: text,
+		choices: options.choices,
+		instructions: false,
+		hint: "- Space to select. Return to submit",
 		onState: (state) => {
 			if (state.aborted) {
 				process.nextTick(() => {

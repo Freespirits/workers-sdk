@@ -1,7 +1,7 @@
 import { resolve } from "path";
 import { setTimeout } from "timers/promises";
 import { fetch } from "undici";
-import { afterAll, beforeAll, describe, it } from "vitest";
+import { afterAll, beforeAll, describe, it, vi } from "vitest";
 import { runWranglerDev } from "../../shared/src/run-wrangler-long-lived";
 
 describe("'wrangler dev' correctly renders pages", () => {
@@ -27,11 +27,16 @@ describe("'wrangler dev' correctly renders pages", () => {
 	});
 
 	it("renders ", async ({ expect }) => {
-		// Note that the local protocol defaults to http
-		const response = await fetch(`http://${ip}:${port}/`);
-		const text = await response.text();
-		expect(response.status).toBe(200);
-		expect(text).toContain(`https://prod.example.org/`);
+		await vi.waitFor(
+			async () => {
+				// Note that the local protocol defaults to http
+				const response = await fetch(`http://${ip}:${port}/`);
+				const text = await response.text();
+				expect(response.status).toBe(200);
+				expect(text).toContain(`https://prod.example.org/`);
+			},
+			{ interval: 1000, timeout: 5000 }
+		);
 
 		// Wait up to 5s for all request logs to be flushed
 		for (let i = 0; i < 10; i++) {
@@ -43,6 +48,13 @@ describe("'wrangler dev' correctly renders pages", () => {
 		const output = getOutput();
 		expect(output).toContain("startup log");
 		expect(output).toContain("request log");
+
+		if (process.platform === "win32") {
+			// Check that the Windows warning is shown for the fake access violation error
+			expect(output).toContain(
+				"On Windows, this may be caused by an outdated Microsoft Visual C++ Redistributable library."
+			);
+		}
 
 		// check host on request in the Worker is as expected
 		expect(output).toContain(`host' => 'prod.example.org`);
@@ -147,5 +159,54 @@ describe("'wrangler dev' correctly renders pages", () => {
 			`hello=world; Domain=${ip}`,
 			`hello2=world2; Domain=${ip}; Secure`,
 		]);
+	});
+
+	it("has access to version_metadata binding", async ({ expect }) => {
+		const response = await fetch(`http://${ip}:${port}/version_metadata`);
+
+		await expect(response.json()).resolves.toMatchObject({
+			id: expect.any(String),
+			tag: expect.any(String),
+		});
+	});
+
+	it("passes through client content encoding", async ({ expect }) => {
+		// https://github.com/cloudflare/workers-sdk/issues/5246
+		const response = await fetch(`http://${ip}:${port}/content-encoding`, {
+			headers: { "Accept-Encoding": "hello" },
+		});
+		expect(await response.json()).toStrictEqual({
+			AcceptEncoding: "br, gzip",
+			clientAcceptEncoding: "hello",
+		});
+	});
+
+	it("supports encoded responses", async ({ expect }) => {
+		const response = await fetch(`http://${ip}:${port}/content-encoding/gzip`, {
+			headers: { "Accept-Encoding": "gzip" },
+		});
+		expect(await response.text()).toEqual("x".repeat(100));
+	});
+
+	it("uses explicit resource management", async ({ expect }) => {
+		const response = await fetch(
+			`http://${ip}:${port}/explicit-resource-management`
+		);
+		expect(await response.json()).toMatchInlineSnapshot(`
+			[
+			  "Connected",
+			  "Connected",
+			  "Sent hello",
+			  "Sent goodbye",
+			  "Disconnected asynchronously",
+			  "Disconnected synchronously",
+			]
+		`);
+	});
+
+	it("reads local dev vars from the .env file", async ({ expect }) => {
+		const response = await fetch(`http://${ip}:${port}/env`);
+		const env = await response.text();
+		expect(env).toBe(`"bar"`);
 	});
 });

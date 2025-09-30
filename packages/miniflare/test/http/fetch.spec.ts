@@ -7,9 +7,9 @@ import test from "ava";
 import {
 	CloseEvent,
 	DeferredPromise,
+	fetch,
 	FormData,
 	MessageEvent,
-	fetch,
 } from "miniflare";
 import { WebSocketServer } from "ws";
 import { flaky, useServer } from "../test-shared";
@@ -56,7 +56,7 @@ test("fetch: performs web socket upgrade", async (t) => {
 	assert(webSocket);
 
 	const eventPromise = new DeferredPromise<void>();
-	const messages: (string | ArrayBuffer)[] = [];
+	const messages: MessageEvent["data"][] = [];
 	webSocket.addEventListener("message", (e) => {
 		messages.push(e.data);
 		if (e.data === "hello server") eventPromise.resolve();
@@ -107,7 +107,7 @@ test("fetch: includes headers from web socket upgrade response", async (t) => {
 		headers: { upgrade: "websocket" },
 	});
 	t.not(res.webSocket, undefined);
-	t.is(res.headers.get("set-cookie"), "key=value");
+	t.is(res.headers.getSetCookie()[0], "key=value");
 });
 const fetchDispatchCloseFlakyTest = flaky(async (t) => {
 	let clientCloses = 0;

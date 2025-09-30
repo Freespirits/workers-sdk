@@ -56,7 +56,7 @@ export function readableRelative(to: string) {
 
 /**
  * The __RELATIVE_PACKAGE_PATH__ is defined either in the esbuild config (for production)
- * or the jest.setup.ts (for unit testing).
+ * or the vitest.setup.ts (for unit testing).
  */
 declare const __RELATIVE_PACKAGE_PATH__: string;
 
@@ -82,6 +82,16 @@ export interface EphemeralDirectory {
 }
 
 /**
+ * Gets the path to the project's `.wrangler` folder.
+ */
+export function getWranglerHiddenDirPath(
+	projectRoot: string | undefined
+): string {
+	projectRoot ??= process.cwd();
+	return path.join(projectRoot, ".wrangler");
+}
+
+/**
  * Gets a temporary directory in the project's `.wrangler` folder with the
  * specified prefix. We create temporary directories in `.wrangler` as opposed
  * to the OS's temporary directory to avoid issues with different drive letters
@@ -90,16 +100,24 @@ export interface EphemeralDirectory {
  */
 export function getWranglerTmpDir(
 	projectRoot: string | undefined,
-	prefix: string
+	prefix: string,
+	cleanup = true
 ): EphemeralDirectory {
-	projectRoot ??= process.cwd();
-	const tmpRoot = path.join(projectRoot, ".wrangler", "tmp");
+	const tmpRoot = path.join(getWranglerHiddenDirPath(projectRoot), "tmp");
 	fs.mkdirSync(tmpRoot, { recursive: true });
 
 	const tmpPrefix = path.join(tmpRoot, `${prefix}-`);
 	const tmpDir = fs.realpathSync(fs.mkdtempSync(tmpPrefix));
 
-	const removeDir = () => fs.rmSync(tmpDir, { recursive: true, force: true });
+	const removeDir = () => {
+		if (cleanup) {
+			try {
+				return fs.rmSync(tmpDir, { recursive: true, force: true });
+			} catch {
+				// This sometimes fails on Windows with EBUSY
+			}
+		}
+	};
 	const removeExitListener = onExit(removeDir);
 
 	return {

@@ -3,7 +3,7 @@ import module from "node:module";
 import path from "node:path";
 import url from "node:url";
 import esbuild from "esbuild";
-import { builtinModules, exportedHandlers } from "./rtti/query.mjs";
+import { builtinModules } from "./rtti/query.mjs";
 
 const argv = process.argv.slice(2);
 const watch = argv[0] === "watch";
@@ -35,8 +35,8 @@ function map(specifier, target) {
 	return { [filePath]: targetPath };
 }
 const fetchMockPathMap = {
-	...map("undici/lib/client.js", "src/mock-agent/client.cjs"),
-	...map("undici/lib/pool.js", "src/mock-agent/pool.cjs"),
+	...map("undici/lib/dispatcher/client.js", "src/mock-agent/client.cjs"),
+	...map("undici/lib/dispatcher/pool.js", "src/mock-agent/pool.cjs"),
 	...map(
 		"undici/lib/mock/pending-interceptors-formatter.js",
 		"src/mock-agent/pending-interceptor-formatter.cjs"
@@ -85,8 +85,32 @@ const commonOptions = {
 	platform: "node",
 	target: "esnext",
 	bundle: true,
-	packages: "external",
-	external: ["cloudflare:*"],
+	external: [
+		// Node.js built-ins (handled automatically by esbuild but listed for completeness)
+		"node:*",
+		"cloudflare:*",
+		"workerd:*",
+		// Virtual/runtime modules
+		"__VITEST_POOL_WORKERS_DEFINES",
+		"__VITEST_POOL_WORKERS_USER_OBJECT",
+		// All npm packages (previously handled by packages: "external")
+		"birpc",
+		"cjs-module-lexer",
+		"devalue",
+		"miniflare",
+		"semver",
+		"semver/*",
+		"wrangler",
+		"zod",
+		"undici",
+		"undici/*",
+		// Peer dependencies
+		"vitest",
+		"vitest/*",
+		"@vitest/runner",
+		"@vitest/snapshot",
+		"@vitest/snapshot/*",
+	],
 	sourcemap: true,
 	sourcesContent: false,
 	logLevel: watch ? "info" : "warning",
@@ -94,8 +118,6 @@ const commonOptions = {
 	outbase: path.join(pkgRoot, "src"),
 	define: {
 		VITEST_POOL_WORKERS_DEFINE_BUILTIN_MODULES: JSON.stringify(builtinModules),
-		VITEST_POOL_WORKERS_DEFINE_EXPORTED_HANDLERS:
-			JSON.stringify(exportedHandlers),
 	},
 };
 

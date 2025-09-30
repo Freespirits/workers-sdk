@@ -1,12 +1,12 @@
+import anyTest, { TestFn } from "ava";
+import { Awaitable, Miniflare, MiniflareOptions } from "miniflare";
+import { TestLog } from "./log";
 import type {
 	ExecutionContext,
 	ServiceWorkerGlobalScope,
 	Request as WorkerRequest,
 	Response as WorkerResponse,
 } from "@cloudflare/workers-types/experimental";
-import anyTest, { TestFn } from "ava";
-import { Awaitable, Miniflare, MiniflareOptions } from "miniflare";
-import { TestLog } from "./log";
 
 export type TestMiniflareHandler<Env> = (
 	global: ServiceWorkerGlobalScope,
@@ -38,7 +38,25 @@ export function namespace<T>(ns: string, binding: T): Namespaced<T> {
 				return (keys: unknown, ...args: unknown[]) => {
 					if (typeof keys === "string") keys = ns + keys;
 					if (Array.isArray(keys)) keys = keys.map((key) => ns + key);
-					return (value as (...args: unknown[]) => unknown)(keys, ...args);
+					const result = (value as (...args: unknown[]) => unknown)(
+						keys,
+						...args
+					);
+					if (result instanceof Promise) {
+						return result.then((res) => {
+							// KV.get([a,b,c]) would be prefixed with ns, so we strip this prefix from response.
+							// Map keys => [{ns}{a}, {ns}{b}, {ns}{b}] -> [a,b,c]
+							if (res instanceof Map) {
+								const newResult = new Map<string, unknown>();
+								for (const [key, value] of res) {
+									newResult.set(key.slice(ns.length), value);
+								}
+								return newResult;
+							}
+							return res;
+						});
+					}
+					return result;
 				};
 			}
 			return value;
@@ -83,7 +101,7 @@ export function miniflareTest<
               status: 500,
               headers: { "MF-Experimental-Error-Stack": "true" },
             });
-          } 
+          }
         }
       }
     `;

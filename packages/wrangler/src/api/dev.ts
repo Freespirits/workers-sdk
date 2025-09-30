@@ -1,18 +1,21 @@
+import events from "node:events";
 import { fetch, Request } from "undici";
-import { startApiDev, startDev } from "../dev";
+import { startDev } from "../dev/start-dev";
+import { getDockerPath } from "../environment-variables/misc-variables";
+import { run } from "../experimental-flags";
 import { logger } from "../logger";
 import type { Environment } from "../config";
 import type { Rule } from "../config/environment";
 import type { CfModule } from "../deployment-bundle/worker";
 import type { StartDevOptions } from "../dev";
 import type { EnablePagesAssetsServiceBindingOptions } from "../miniflare-cli/types";
-import type { ProxyData } from "./startDevWorker";
 import type { Json } from "miniflare";
 import type { RequestInfo, RequestInit, Response } from "undici";
 
-export interface UnstableDevOptions {
+export interface Unstable_DevOptions {
 	config?: string; // Path to .toml configuration file, relative to cwd
-	env?: string; // Environment to use for operations and .env files
+	env?: string; // Environment to use for operations, and for selecting .env and .dev.vars files
+	envFiles?: string[]; // Paths to .env files to load, relative to cwd
 	ip?: string; // IP address to listen on
 	port?: number; // Port to listen on
 	bundle?: boolean; // Set to false to skip internal build steps and directly deploy script
@@ -24,7 +27,6 @@ export interface UnstableDevOptions {
 	site?: string; // Root folder of static assets for Workers Sites
 	siteInclude?: string[]; // Array of .gitignore-style patterns that match file or directory names from the sites directory. Only matched items will be uploaded.
 	siteExclude?: string[]; // Array of .gitignore-style patterns that match file or directory names from the sites directory. Matched items will not be uploaded.
-	nodeCompat?: boolean; // Enable Node.js compatibility
 	compatibilityDate?: string; // Date to use for compatibility checks
 	compatibilityFlags?: string[]; // Flags to use for compatibility checks
 	persist?: boolean; // Enable persistence for local mode, using default path: .wrangler/state
@@ -32,8 +34,9 @@ export interface UnstableDevOptions {
 	vars?: Record<string, string | Json>;
 	kv?: {
 		binding: string;
-		id: string;
+		id?: string;
 		preview_id?: string;
+		remote?: boolean;
 	}[];
 	durableObjects?: {
 		name: string;
@@ -45,13 +48,19 @@ export interface UnstableDevOptions {
 		binding: string;
 		service: string;
 		environment?: string | undefined;
+		entrypoint?: string | undefined;
+		remote?: boolean;
 	}[];
 	r2?: {
 		binding: string;
-		bucket_name: string;
+		bucket_name?: string;
 		preview_bucket_name?: string;
+		remote?: boolean;
 	}[];
 	ai?: {
+		binding: string;
+	};
+	version_metadata?: {
 		binding: string;
 	};
 	moduleRoot?: string;
@@ -60,7 +69,6 @@ export interface UnstableDevOptions {
 	inspect?: boolean;
 	local?: boolean;
 	accountId?: string;
-	updateCheck?: boolean;
 	experimental?: {
 		processEntrypoint?: boolean;
 		additionalModules?: CfModule[];
@@ -74,13 +82,20 @@ export interface UnstableDevOptions {
 		testMode?: boolean; // This option shouldn't be used - We plan on removing it eventually
 		testScheduled?: boolean; // Test scheduled events by visiting /__scheduled in browser
 		watch?: boolean; // unstable_dev doesn't support watch-mode yet in testMode
+		devEnv?: boolean;
+		fileBasedRegistry?: boolean;
+		vectorizeBindToProd?: boolean;
+		imagesLocalMode?: boolean;
+		enableIpc?: boolean;
+		enableContainers?: boolean; // Whether to build and connect to containers in dev mode. Defaults to true.
+		dockerPath?: string; // Path to the docker binary, if not on $PATH
+		containerEngine?: string; // Docker socket
 	};
 }
 
-export interface UnstableDevWorker {
+export interface Unstable_DevWorker {
 	port: number;
 	address: string;
-	proxyData: ProxyData;
 	stop: () => Promise<void>;
 	fetch: (input?: RequestInfo, init?: RequestInit) => Promise<Response>;
 	waitUntilExit: () => Promise<void>;
@@ -90,9 +105,9 @@ export interface UnstableDevWorker {
  */
 export async function unstable_dev(
 	script: string,
-	options?: UnstableDevOptions,
+	options?: Unstable_DevOptions,
 	apiOptions?: unknown
-): Promise<UnstableDevWorker> {
+): Promise<Unstable_DevWorker> {
 	// Note that not every experimental option is passed directly through to the underlying dev API - experimental options can be used here in unstable_dev. Otherwise we could just pass experimental down to dev blindly.
 
 	const experimentalOptions = {
@@ -117,6 +132,8 @@ export async function unstable_dev(
 		showInteractiveDevSession,
 		testMode,
 		testScheduled,
+		vectorizeBindToProd,
+		imagesLocalMode,
 		// 2. options for alpha/beta products/libs
 		d1Databases,
 		enablePagesAssetsServiceBinding,
@@ -137,7 +154,6 @@ export async function unstable_dev(
 	type ReadyInformation = {
 		address: string;
 		port: number;
-		proxyData: ProxyData;
 	};
 	let readyResolve: (info: ReadyInformation) => void;
 	const readyPromise = new Promise<ReadyInformation>((resolve) => {
@@ -147,6 +163,8 @@ export async function unstable_dev(
 	const defaultLogLevel = testMode ? "warn" : "log";
 	const local = options?.local ?? true;
 
+	const dockerPath = options?.experimental?.dockerPath ?? getDockerPath();
+
 	const devOptions: StartDevOptions = {
 		script: script,
 		inspect: false,
@@ -154,7 +172,6 @@ export async function unstable_dev(
 		$0: "",
 		remote: !local,
 		local: undefined,
-		experimentalLocal: undefined,
 		d1Databases,
 		disableDevRegistry,
 		testScheduled: testScheduled ?? false,
@@ -162,104 +179,91 @@ export async function unstable_dev(
 		forceLocal,
 		liveReload,
 		showInteractiveDevSession,
-		onReady: (address, port, proxyData) => {
-			readyResolve({ address, port, proxyData });
+		onReady: (address, port) => {
+			readyResolve({ address, port });
 		},
 		config: options?.config,
 		env: options?.env,
+		envFile: options?.envFiles,
 		processEntrypoint,
 		additionalModules,
 		bundle: options?.bundle,
 		compatibilityDate: options?.compatibilityDate,
 		compatibilityFlags: options?.compatibilityFlags,
-		ip: options?.ip,
+		ip: "127.0.0.1",
 		inspectorPort: options?.inspectorPort ?? 0,
 		v: undefined,
+		cwd: undefined,
 		localProtocol: options?.localProtocol,
 		httpsKeyPath: options?.httpsKeyPath,
 		httpsCertPath: options?.httpsCertPath,
-		assets: options?.assets,
+		assets: undefined,
 		site: options?.site, // Root folder of static assets for Workers Sites
 		siteInclude: options?.siteInclude, // Array of .gitignore-style patterns that match file or directory names from the sites directory. Only matched items will be uploaded.
 		siteExclude: options?.siteExclude, // Array of .gitignore-style patterns that match file or directory names from the sites directory. Matched items will not be uploaded.
-		nodeCompat: options?.nodeCompat, // Enable Node.js compatibility
 		persist: options?.persist, // Enable persistence for local mode, using default path: .wrangler/state
 		persistTo: options?.persistTo, // Specify directory to use for local persistence (implies --persist)
-		experimentalJsonConfig: undefined,
 		name: undefined,
 		noBundle: false,
-		format: undefined,
 		latest: false,
 		routes: undefined,
 		host: undefined,
 		localUpstream: undefined,
-		experimentalPublic: undefined,
 		upstreamProtocol: undefined,
 		var: undefined,
 		define: undefined,
+		alias: undefined,
 		jsxFactory: undefined,
 		jsxFragment: undefined,
 		tsconfig: undefined,
 		minify: undefined,
-		experimentalEnableLocalPersistence: undefined,
 		legacyEnv: undefined,
-		public: undefined,
 		...options,
 		logLevel: options?.logLevel ?? defaultLogLevel,
 		port: options?.port ?? 0,
-		updateCheck: options?.updateCheck ?? false,
+		experimentalProvision: undefined,
+		experimentalRemoteBindings: true,
+		experimentalVectorizeBindToProd: vectorizeBindToProd ?? false,
+		experimentalImagesLocalMode: imagesLocalMode ?? false,
+		enableIpc: options?.experimental?.enableIpc,
+		nodeCompat: undefined,
+		enableContainers: options?.experimental?.enableContainers ?? false,
+		dockerPath,
+		containerEngine: options?.experimental?.containerEngine,
 	};
 
-	//due to Pages adoption of unstable_dev, we can't *just* disable rebuilds and watching. instead, we'll have two versions of startDev, which will converge.
-	if (testMode) {
-		// in testMode, we can run multiple wranglers in parallel, but rebuilds might not work out of the box
-		// once the devServer is ready for requests, we resolve the ready promise
-		const devServer = await startApiDev(devOptions);
-		const { port, address, proxyData } = await readyPromise;
-		return {
-			port,
-			address,
-			proxyData,
-			stop: devServer.stop,
-			fetch: async (input?: RequestInfo, init?: RequestInit) => {
-				return await fetch(
-					...parseRequestInput(
-						address,
-						port,
-						input,
-						init,
-						options?.localProtocol
-					)
-				);
-			},
-			//no-op, does nothing in tests
-			waitUntilExit: async () => {
-				return;
-			},
-		};
-	} else {
-		//outside of test mode, rebuilds work fine, but only one instance of wrangler will work at a time
-		const devServer = await startDev(devOptions);
-		const { port, address, proxyData } = await readyPromise;
-		return {
-			port,
-			address,
-			proxyData,
-			stop: devServer.stop,
-			fetch: async (input?: RequestInfo, init?: RequestInit) => {
-				return await fetch(
-					...parseRequestInput(
-						address,
-						port,
-						input,
-						init,
-						options?.localProtocol
-					)
-				);
-			},
-			waitUntilExit: devServer.devReactElement.waitUntilExit,
-		};
-	}
+	//outside of test mode, rebuilds work fine, but only one instance of wrangler will work at a time
+	const devServer = await run(
+		{
+			// TODO: can we make this work?
+			MULTIWORKER: false,
+			RESOURCES_PROVISION: false,
+			REMOTE_BINDINGS: false,
+			DEPLOY_REMOTE_DIFF_CHECK: false,
+		},
+		() => startDev(devOptions)
+	);
+	const { port, address } = await readyPromise;
+
+	return {
+		port,
+		address,
+		stop: async () => {
+			await devServer.devEnv.teardown.bind(devServer.devEnv)();
+			const teardownRegistry = await devServer.teardownRegistryPromise;
+			await teardownRegistry?.(devServer.devEnv.config.latestConfig?.name);
+
+			devServer.unregisterHotKeys?.();
+		},
+		fetch: async (input?: RequestInfo, init?: RequestInit) => {
+			return await fetch(
+				...parseRequestInput(address, port, input, init, options?.localProtocol)
+			);
+		},
+		waitUntilExit: async () => {
+			await events.once(devServer.devEnv, "teardown");
+		},
+	};
 }
 
 export function parseRequestInput(
@@ -270,8 +274,10 @@ export function parseRequestInput(
 	protocol: "http" | "https" = "http"
 ): [RequestInfo, RequestInit] {
 	// Make sure URL is absolute
-	if (typeof input === "string") input = new URL(input, "http://placeholder");
-	// Adapted from Miniflare 3's `dispatchFetch()` function
+	if (typeof input === "string") {
+		input = new URL(input, "http://placeholder");
+	}
+	// Adapted from Miniflare's `dispatchFetch()` function
 	const forward = new Request(input, init);
 	const url = new URL(forward.url);
 	forward.headers.set("MF-Original-URL", url.toString());

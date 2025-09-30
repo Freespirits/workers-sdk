@@ -1,10 +1,12 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile } from "node:fs/promises";
 import path from "node:path";
 import { Mutex } from "miniflare";
 import onExit from "signal-exit";
+import stripAnsi from "strip-ansi";
 import { getEnvironmentVariableFactory } from "../environment-variables/factory";
 import { getGlobalWranglerConfigPath } from "../global-wrangler-config-path";
 import { logger } from "../logger";
+import { ensureDirectoryExists } from "./filesystem";
 import type { LoggerLevel } from "../logger";
 
 const getDebugFileDir = getEnvironmentVariableFactory({
@@ -34,12 +36,6 @@ function getDebugFilepath() {
 	return path.resolve(filepath);
 }
 
-async function ensureDirectoryExists(filepath: string) {
-	const dirpath = path.dirname(filepath);
-
-	await mkdir(dirpath, { recursive: true });
-}
-
 export const debugLogFilepath = getDebugFilepath();
 const mutex = new Mutex();
 
@@ -56,7 +52,7 @@ export async function appendToDebugLogFile(
 ) {
 	const entry = `
 --- ${new Date().toISOString()} ${messageLevel}
-${message}
+${stripAnsi(message)}
 ---
 `;
 
@@ -68,8 +64,11 @@ ${message}
 			// TODO(consider): recommend opening an issue with the contents of this file?
 			if (hasSeenErrorMessage) {
 				// use console.*warn* here so not to pollute stdout -- some commands print json to stdout
-				// use *console*.warn here so not to have include the *very* visible bright-yellow [WARNING] indicator
-				console.warn(`🪵  Logs were written to "${debugLogFilepath}"`);
+				// use logger.*console*("warn", ...) here so not to have include the *very* visible bright-yellow [WARNING] indicator
+				logger.console(
+					"warn",
+					`🪵  Logs were written to "${debugLogFilepath}"`
+				);
 			}
 		});
 	}
@@ -91,11 +90,4 @@ ${message}
 			}
 		}
 	});
-}
-
-/**
- * Reads the current log file after waiting for all pending writes
- */
-export function readDebugLogFile(): Promise<string> {
-	return mutex.runWith(() => readFile(debugLogFilepath, "utf-8"));
 }

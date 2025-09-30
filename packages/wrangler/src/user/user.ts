@@ -213,17 +213,22 @@ import path from "node:path";
 import url from "node:url";
 import { TextEncoder } from "node:util";
 import TOML from "@iarna/toml";
+import dedent from "ts-dedent";
 import { fetch } from "undici";
+import { configFileName } from "../config";
 import {
 	getConfigCache,
 	purgeConfigCaches,
 	saveToConfigCache,
 } from "../config-cache";
 import { NoDefaultValueProvided, select } from "../dialogs";
+import {
+	getCloudflareApiEnvironmentFromEnv,
+	getCloudflareComplianceRegion,
+} from "../environment-variables/misc-variables";
 import { UserError } from "../errors";
 import { getGlobalWranglerConfigPath } from "../global-wrangler-config-path";
-import { CI } from "../is-ci";
-import isInteractive from "../is-interactive";
+import { isNonInteractiveOrCI } from "../is-interactive";
 import { logger } from "../logger";
 import openInBrowser from "../open-in-browser";
 import { parseTOML, readFileSync } from "../parse";
@@ -243,8 +248,10 @@ import {
 import { getAccountChoices } from "./choose-account";
 import { generateAuthUrl } from "./generate-auth-url";
 import { generateRandomState } from "./generate-random-state";
+import type { ComplianceConfig } from "../environment-variables/misc-variables";
 import type { ChooseAccountItem } from "./choose-account";
 import type { ParsedUrlQuery } from "node:querystring";
+import type { Response } from "undici";
 
 export type ApiCredentials =
 	| {
@@ -306,7 +313,7 @@ interface AuthTokens {
  * The path to the config file that holds user authentication data,
  * relative to the user's home directory.
  */
-export const USER_AUTH_CONFIG_FILE = "config/default.toml";
+const USER_AUTH_CONFIG_PATH = "config";
 
 /**
  * The data that may be read from the `USER_CONFIG_FILE`.
@@ -348,27 +355,26 @@ const DefaultScopes = {
 		"See and change Cloudflare Pages projects, settings and deployments.",
 	"zone:read": "Grants read level access to account zone.",
 	"ssl_certs:write": "See and manage mTLS certificates for your account",
-	"constellation:write": "Manage Constellation projects/models",
-	"ai:read": "List AI models",
-} as const;
-
-const OptionalScopes = {
+	"ai:write": "See and change Workers AI catalog and assets",
+	"queues:write": "See and change Cloudflare Queues settings and data",
+	"pipelines:write":
+		"See and change Cloudflare Pipelines configurations and data",
+	"secrets_store:write":
+		"See and change secrets + stores within the Secrets Store",
+	"containers:write": "Manage Workers Containers",
 	"cloudchamber:write": "Manage Cloudchamber",
+	"connectivity:admin":
+		" See, change, and bind to Connectivity Directory services, including creating services targeting Cloudflare Tunnel.",
 } as const;
-
-const AllScopes = {
-	...DefaultScopes,
-	...OptionalScopes,
-};
 
 /**
  * The possible keys for a Scope.
  *
  * "offline_access" is automatically included.
  */
-type Scope = keyof typeof AllScopes;
+export type Scope = keyof typeof DefaultScopes;
 
-let DefaultScopeKeys = Object.keys(DefaultScopes) as Scope[];
+export let DefaultScopeKeys = Object.keys(DefaultScopes) as Scope[];
 
 export function setLoginScopeKeys(scopes: Scope[]) {
 	DefaultScopeKeys = scopes;
@@ -380,7 +386,9 @@ export function validateScopeKeys(
 	return scopes.every((scope) => scope in DefaultScopes);
 }
 
-const CALLBACK_URL = "http://localhost:8976/oauth/callback";
+function getCallbackUrl(host = "localhost", port = 8976) {
+	return `http://${host}:${port}/oauth/callback`;
+}
 
 let LocalState: State = {
 	...getAuthTokens(),
@@ -393,7 +401,9 @@ function getAuthTokens(config?: UserAuthConfig): AuthTokens | undefined {
 	// get refreshToken/accessToken from fs if exists
 	try {
 		// if the environment variable is available, we don't need to do anything here
-		if (getAuthFromEnv()) return;
+		if (getAuthFromEnv()) {
+			return;
+		}
 
 		// otherwise try loading from the user auth config file.
 		const { oauth_token, refresh_token, expiration_time, scopes, api_token } =
@@ -448,10 +458,14 @@ export function getAPIToken(): ApiCredentials | undefined {
 	}
 
 	const localAPIToken = getAuthFromEnv();
-	if (localAPIToken) return localAPIToken;
+	if (localAPIToken) {
+		return localAPIToken;
+	}
 
 	const storedAccessToken = LocalState.accessToken?.value;
-	if (storedAccessToken) return { apiToken: storedAccessToken };
+	if (storedAccessToken) {
+		return { apiToken: storedAccessToken };
+	}
 
 	return undefined;
 }
@@ -651,7 +665,12 @@ function isReturningFromAuthServer(query: ParsedUrlQuery): boolean {
 	return true;
 }
 
-export async function getAuthURL(scopes = DefaultScopeKeys): Promise<string> {
+async function getAuthURL(
+	scopes: string[],
+	clientId: string,
+	callbackHost: string,
+	callbackPort: number
+): Promise<string> {
 	const { codeChallenge, codeVerifier } = await generatePKCECodes();
 	const stateQueryParam = generateRandomState(RECOMMENDED_STATE_LENGTH);
 
@@ -663,8 +682,8 @@ export async function getAuthURL(scopes = DefaultScopeKeys): Promise<string> {
 
 	return generateAuthUrl({
 		authUrl: getAuthUrlFromEnv(),
-		clientId: getClientIdFromEnv(),
-		callbackUrl: CALLBACK_URL,
+		clientId,
+		callbackUrl: getCallbackUrl(callbackHost, callbackPort),
 		scopes,
 		stateQueryParam,
 		codeChallenge,
@@ -704,7 +723,7 @@ async function exchangeRefreshTokenForAccessToken(): Promise<AccessContext> {
 		try {
 			tokenExchangeResErr = await response.text();
 			tokenExchangeResErr = JSON.parse(tokenExchangeResErr);
-		} catch (e) {
+		} catch {
 			// If it can't parse to JSON ignore the error
 		}
 
@@ -720,7 +739,7 @@ async function exchangeRefreshTokenForAccessToken(): Promise<AccessContext> {
 		}
 	} else {
 		try {
-			const json = (await response.json()) as TokenResponse;
+			const json = (await getJSONFromResponse(response)) as TokenResponse;
 			if ("error" in json) {
 				throw json.error;
 			}
@@ -778,14 +797,16 @@ async function exchangeAuthCodeForAccessToken(): Promise<AccessContext> {
 	const params = new URLSearchParams({
 		grant_type: `authorization_code`,
 		code: authorizationCode ?? "",
-		redirect_uri: CALLBACK_URL,
+		redirect_uri: getCallbackUrl(),
 		client_id: getClientIdFromEnv(),
 		code_verifier: codeVerifier,
 	});
 
 	const response = await fetchAuthToken(params);
 	if (!response.ok) {
-		const { error } = (await response.json()) as { error: string };
+		const { error } = (await getJSONFromResponse(response)) as {
+			error: string;
+		};
 		// .catch((_) => ({ error: "invalid_json" }));
 		if (error === "invalid_grant") {
 			logger.log("Expired! Auth code or refresh token needs to be renewed.");
@@ -794,7 +815,7 @@ async function exchangeAuthCodeForAccessToken(): Promise<AccessContext> {
 		}
 		throw toErrorClass(error);
 	}
-	const json = (await response.json()) as TokenResponse;
+	const json = (await getJSONFromResponse(response)) as TokenResponse;
 	if ("error" in json) {
 		throw new Error(json.error);
 	}
@@ -868,51 +889,52 @@ async function generatePKCECodes(): Promise<PKCECodes> {
 	return { codeChallenge, codeVerifier };
 }
 
+export function getAuthConfigFilePath() {
+	const environment = getCloudflareApiEnvironmentFromEnv();
+	const filePath = `${USER_AUTH_CONFIG_PATH}/${environment === "production" ? "default.toml" : `${environment}.toml`}`;
+
+	return path.join(getGlobalWranglerConfigPath(), filePath);
+}
+
 /**
  * Writes a a wrangler config file (auth credentials) to disk,
  * and updates the user auth state with the new credentials.
  */
 export function writeAuthConfigFile(config: UserAuthConfig) {
-	const authConfigFilePath = path.join(
-		getGlobalWranglerConfigPath(),
-		USER_AUTH_CONFIG_FILE
-	);
-	mkdirSync(path.dirname(authConfigFilePath), {
+	const configPath = getAuthConfigFilePath();
+
+	mkdirSync(path.dirname(configPath), {
 		recursive: true,
 	});
-	writeFileSync(
-		path.join(authConfigFilePath),
-		TOML.stringify(config as TOML.JsonMap),
-		{ encoding: "utf-8" }
-	);
+	writeFileSync(path.join(configPath), TOML.stringify(config as TOML.JsonMap), {
+		encoding: "utf-8",
+	});
 
 	reinitialiseAuthTokens();
 }
 
 export function readAuthConfigFile(): UserAuthConfig {
-	const authConfigFilePath = path.join(
-		getGlobalWranglerConfigPath(),
-		USER_AUTH_CONFIG_FILE
-	);
-	const toml = parseTOML(readFileSync(authConfigFilePath));
+	const toml = parseTOML(readFileSync(getAuthConfigFilePath()));
 	return toml;
 }
 
 type LoginProps = {
 	scopes?: Scope[];
 	browser: boolean;
+	callbackHost: string;
+	callbackPort: number;
 };
 
 export async function loginOrRefreshIfRequired(
+	complianceConfig: ComplianceConfig,
 	props?: LoginProps
 ): Promise<boolean> {
 	// TODO: if there already is a token, then try refreshing
 	// TODO: ask permission before opening browser
-	const { isCI } = CI;
 	if (!getAPIToken()) {
 		// Not logged in.
 		// If we are not interactive, we cannot ask the user to login
-		return isInteractive() && !isCI() && (await login(props));
+		return !isNonInteractiveOrCI() && (await login(complianceConfig, props));
 	} else if (isAccessTokenExpired()) {
 		// We're logged in, but the refresh token seems to have expired,
 		// so let's try to refresh it
@@ -922,44 +944,68 @@ export async function loginOrRefreshIfRequired(
 			return true;
 		} else {
 			// If the refresh token isn't valid, then we ask the user to login again
-			return isInteractive() && !isCI() && (await login(props));
+			return !isNonInteractiveOrCI() && (await login(complianceConfig, props));
 		}
 	} else {
 		return true;
 	}
 }
 
-export async function login(
-	props: LoginProps = { browser: true }
-): Promise<boolean> {
-	logger.log("Attempting to login via OAuth...");
-	const urlToOpen = await getAuthURL(props?.scopes);
+export async function getOauthToken(options: {
+	browser: boolean;
+	scopes: string[];
+	clientId: string;
+	denied: {
+		url: string;
+		error: string;
+	};
+	granted: {
+		url: string;
+	};
+	callbackHost: string;
+	callbackPort: number;
+}): Promise<AccessContext> {
+	const urlToOpen = await getAuthURL(
+		options.scopes,
+		options.clientId,
+		options.callbackHost,
+		options.callbackPort
+	);
 	let server: http.Server;
-	let loginTimeoutHandle: NodeJS.Timeout;
-	const timerPromise = new Promise<boolean>((resolve) => {
+	let loginTimeoutHandle: ReturnType<typeof setTimeout>;
+	const timerPromise = new Promise<AccessContext>((_, reject) => {
 		loginTimeoutHandle = setTimeout(() => {
-			logger.error(
-				"Timed out waiting for authorization code, please try again."
-			);
 			server.close();
 			clearTimeout(loginTimeoutHandle);
-			resolve(false);
+			reject(
+				new UserError(
+					"Timed out waiting for authorization code, please try again."
+				)
+			);
 		}, 120000); // wait for 120 seconds for the user to authorize
 	});
 
-	const loginPromise = new Promise<boolean>((resolve, reject) => {
+	const loginPromise = new Promise<AccessContext>((resolve, reject) => {
 		server = http.createServer(async (req, res) => {
-			function finish(status: boolean, error?: Error) {
+			function finish(token: null, error: Error): void;
+			function finish(token: AccessContext): void;
+			function finish(token: AccessContext | null, error?: Error) {
 				clearTimeout(loginTimeoutHandle);
 				server.close((closeErr?: Error) => {
 					if (error || closeErr) {
 						reject(error || closeErr);
-					} else resolve(status);
+					} else {
+						assert(token);
+						resolve(token);
+					}
 				});
 			}
 
 			assert(req.url, "This request doesn't have a URL"); // This should never happen
 			const { pathname, query } = url.parse(req.url, true);
+			if (req.method !== "GET") {
+				return res.end("OK");
+			}
 			switch (pathname) {
 				case "/oauth/callback": {
 					let hasAuthCode = false;
@@ -968,45 +1014,30 @@ export async function login(
 					} catch (err: unknown) {
 						if (err instanceof ErrorAccessDenied) {
 							res.writeHead(307, {
-								Location:
-									"https://welcome.developers.workers.dev/wrangler-oauth-consent-denied",
+								Location: options.denied.url,
 							});
 							res.end(() => {
-								finish(false);
+								finish(null, new UserError(options.denied.error));
 							});
-							logger.error(
-								"Error: Consent denied. You must grant consent to Wrangler in order to login.\n" +
-									"If you don't want to do this consider passing an API token via the `CLOUDFLARE_API_TOKEN` environment variable"
-							);
 
 							return;
 						} else {
-							finish(false, err as Error);
+							finish(null, err as Error);
 							return;
 						}
 					}
 					if (!hasAuthCode) {
 						// render an error page here
-						finish(false, new ErrorNoAuthCode());
+						finish(null, new ErrorNoAuthCode());
 						return;
 					} else {
 						const exchange = await exchangeAuthCodeForAccessToken();
-						writeAuthConfigFile({
-							oauth_token: exchange.token?.value ?? "",
-							expiration_time: exchange.token?.expiry,
-							refresh_token: exchange.refreshToken?.value,
-							scopes: exchange.scopes,
-						});
 						res.writeHead(307, {
-							Location:
-								"https://welcome.developers.workers.dev/wrangler-oauth-consent-granted",
+							Location: options.granted.url,
 						});
 						res.end(() => {
-							finish(true);
+							finish(exchange);
 						});
-						logger.log(`Successfully logged in.`);
-
-						purgeConfigCaches();
 
 						return;
 					}
@@ -1014,9 +1045,14 @@ export async function login(
 			}
 		});
 
-		server.listen(8976, "localhost");
+		if (options.callbackHost !== "localhost" || options.callbackPort !== 8976) {
+			logger.log(
+				`Temporary login server listening on ${options.callbackHost}:${options.callbackPort}`
+			);
+		}
+		server.listen(options.callbackPort, options.callbackHost);
 	});
-	if (props?.browser) {
+	if (options.browser) {
 		logger.log(`Opening a link in your default browser: ${urlToOpen}`);
 		await openInBrowser(urlToOpen);
 	} else {
@@ -1024,6 +1060,68 @@ export async function login(
 	}
 
 	return Promise.race([timerPromise, loginPromise]);
+}
+
+export async function login(
+	complianceConfig: ComplianceConfig,
+	props: LoginProps = {
+		browser: true,
+		callbackHost: "localhost",
+		callbackPort: 8976,
+	}
+): Promise<boolean> {
+	const authFromEnv = getAuthFromEnv();
+	if (authFromEnv) {
+		// Auth from env overrides any login details, so no point in allowing the user to login.
+		logger.error(
+			"You are logged in with an API Token. Unset the CLOUDFLARE_API_TOKEN in the " +
+				"environment to log in via OAuth."
+		);
+		return false;
+	}
+
+	const complianceRegion = getCloudflareComplianceRegion(complianceConfig);
+	if (complianceRegion === "fedramp_high") {
+		const configurationSource = complianceConfig?.compliance_region
+			? "`compliance_region` configuration property"
+			: "`CLOUDFLARE_API_ENVIRONMENT` environment variable";
+		throw new UserError(dedent`
+			OAuth login is not supported in the \`${complianceRegion}\` compliance region.
+			Please use a Cloudflare API token (\`CLOUDFLARE_API_TOKEN\` environment variable) or remove the ${configurationSource}.
+		`);
+	}
+
+	logger.log("Attempting to login via OAuth...");
+
+	const oauth = await getOauthToken({
+		browser: !!props.browser,
+		scopes: props.scopes ?? DefaultScopeKeys,
+		clientId: getClientIdFromEnv(),
+		denied: {
+			url: "https://welcome.developers.workers.dev/wrangler-oauth-consent-denied",
+			error:
+				"Error: Consent denied. You must grant consent to Wrangler in order to login.\n" +
+				"If you don't want to do this consider passing an API token via the `CLOUDFLARE_API_TOKEN` environment variable",
+		},
+		granted: {
+			url: "https://welcome.developers.workers.dev/wrangler-oauth-consent-granted",
+		},
+		callbackHost: props.callbackHost,
+		callbackPort: props.callbackPort,
+	});
+
+	writeAuthConfigFile({
+		oauth_token: oauth.token?.value ?? "",
+		expiration_time: oauth.token?.expiry,
+		refresh_token: oauth.refreshToken?.value,
+		scopes: oauth.scopes,
+	});
+
+	logger.log(`Successfully logged in.`);
+
+	purgeConfigCaches();
+
+	return true;
 }
 
 /**
@@ -1052,12 +1150,22 @@ async function refreshToken(): Promise<boolean> {
 			scopes,
 		});
 		return true;
-	} catch (err) {
+	} catch {
 		return false;
 	}
 }
 
 export async function logout(): Promise<void> {
+	const authFromEnv = getAuthFromEnv();
+	if (authFromEnv) {
+		// Auth from env overrides any login details, so we cannot log out.
+		logger.log(
+			"You are logged in with an API Token. Unset the CLOUDFLARE_API_TOKEN in the " +
+				"environment to log out."
+		);
+		return;
+	}
+
 	if (!LocalState.accessToken) {
 		if (!LocalState.refreshToken) {
 			logger.log("Not logged in, exiting...");
@@ -1094,31 +1202,34 @@ export async function logout(): Promise<void> {
 		},
 	});
 	await response.text(); // blank text? would be nice if it was something meaningful
-	rmSync(path.join(getGlobalWranglerConfigPath(), USER_AUTH_CONFIG_FILE));
+	rmSync(getAuthConfigFilePath());
 	logger.log(`Successfully logged out.`);
 }
 
 export function listScopes(message = "💁 Available scopes:"): void {
 	logger.log(message);
-	const data = DefaultScopeKeys.map((scope: Scope) => ({
-		Scope: scope,
-		Description: AllScopes[scope],
-	}));
-	logger.table(data);
+	printScopes(DefaultScopeKeys);
 	// TODO: maybe a good idea to show usage here
 }
 
-export async function getAccountId(): Promise<string | undefined> {
-	const apiToken = getAPIToken();
-	if (!apiToken) return;
-
+/**
+ *
+ * Returns account_id preferentially from config.account_id > CLOUDFLARE_ACCOUNT_ID env var > cache > or user selection.
+ */
+export async function getAccountId(
+	config: ComplianceConfig & { account_id?: string }
+): Promise<string> {
+	// TODO: v5 we should prioritise the env var instead of the config value here, for consistency
+	if (config.account_id) {
+		return config.account_id;
+	}
 	// check if we have a cached value
 	const cachedAccount = getAccountFromCache();
 	if (cachedAccount && !getCloudflareAccountIdFromEnv()) {
 		return cachedAccount.id;
 	}
 
-	const accounts = await getAccountChoices();
+	const accounts = await getAccountChoices(config);
 	if (accounts.length === 1) {
 		saveAccountToCache({ id: accounts[0].id, name: accounts[0].name });
 		return accounts[0].id;
@@ -1141,7 +1252,7 @@ export async function getAccountId(): Promise<string | undefined> {
 		if (e instanceof NoDefaultValueProvided) {
 			throw new UserError(
 				`More than one account available but unable to select one in non-interactive mode.
-Please set the appropriate \`account_id\` in your \`wrangler.toml\` file.
+Please set the appropriate \`account_id\` in your ${configFileName(undefined)} file or assign it to the \`CLOUDFLARE_ACCOUNT_ID\` environment variable.
 Available accounts are (\`<name>\`: \`<account_id>\`):
 ${accounts
 	.map((account) => `  \`${account.name}\`: \`${account.id}\``)
@@ -1155,12 +1266,14 @@ ${accounts
 /**
  * Ensure that a user is logged in, and a valid account_id is available.
  */
-export async function requireAuth(config: {
-	account_id?: string;
-}): Promise<string> {
-	const loggedIn = await loginOrRefreshIfRequired();
+export async function requireAuth(
+	config: ComplianceConfig & {
+		account_id?: string;
+	}
+): Promise<string> {
+	const loggedIn = await loginOrRefreshIfRequired(config);
 	if (!loggedIn) {
-		if (!isInteractive() || CI.isCI()) {
+		if (isNonInteractiveOrCI()) {
 			throw new UserError(
 				"In a non-interactive environment, it's necessary to set a CLOUDFLARE_API_TOKEN environment variable for wrangler to work. Please go to https://developers.cloudflare.com/fundamentals/api/get-started/create-token/ for instructions on how to create an api token, and assign its value to CLOUDFLARE_API_TOKEN."
 			);
@@ -1169,7 +1282,7 @@ export async function requireAuth(config: {
 			throw new UserError("Did not login, quitting...");
 		}
 	}
-	const accountId = config.account_id || (await getAccountId());
+	const accountId = await getAccountId(config);
 	if (!accountId) {
 		throw new UserError("No account id found, quitting...");
 	}
@@ -1191,10 +1304,7 @@ export function requireApiToken(): ApiCredentials {
 /**
  * Save the given account details to a cache
  */
-export function saveAccountToCache(account: {
-	id: string;
-	name: string;
-}): void {
+function saveAccountToCache(account: { id: string; name: string }): void {
 	saveToConfigCache<{ account: { id: string; name: string } }>(
 		"wrangler-account.json",
 		{ account }
@@ -1220,6 +1330,15 @@ export function getScopes(): Scope[] | undefined {
 	return LocalState.scopes;
 }
 
+export function printScopes(scopes: Scope[]) {
+	const data = scopes.map((scope: Scope) => ({
+		Scope: scope,
+		Description: DefaultScopes[scope],
+	}));
+
+	logger.table(data);
+}
+
 /**
  * Make a request to the Cloudflare OAuth endpoint to get a token.
  *
@@ -1239,4 +1358,28 @@ async function fetchAuthToken(body: URLSearchParams) {
 		body: body.toString(),
 		headers,
 	});
+}
+
+async function getJSONFromResponse(response: Response) {
+	const text = await response.text();
+	try {
+		return JSON.parse(text);
+	} catch (e) {
+		// Sometime we get an error response where the body is HTML
+		if (text.match(/<!DOCTYPE html>/)) {
+			logger.error(
+				"The body of the response was HTML rather than JSON. Check the debug logs to see the full body of the response."
+			);
+			if (text.match(/challenge-platform/)) {
+				logger.error(
+					`It looks like you might have hit a bot challenge page. This may be transient but if not, please contact Cloudflare to find out what can be done. When you contact Cloudflare, please provide your Ray ID: ${response.headers.get("cf-ray")}`
+				);
+			}
+		}
+		logger.debug("Full body of response\n\n", text);
+		throw new Error(
+			`Invalid JSON in response: status: ${response.status} ${response.statusText}`,
+			{ cause: e }
+		);
+	}
 }

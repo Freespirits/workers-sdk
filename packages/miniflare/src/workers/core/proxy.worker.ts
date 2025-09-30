@@ -5,17 +5,19 @@ import { readPrefix, reduceError } from "miniflare:shared";
 import {
 	CoreBindings,
 	CoreHeaders,
+	isFetcherFetch,
+	isImagesInput,
+	isR2ObjectWriteHttpMetadata,
 	ProxyAddresses,
 	ProxyOps,
-	isFetcherFetch,
-	isR2ObjectWriteHttpMetadata,
 } from "./constants";
 import {
-	PlatformImpl,
-	ReducersRevivers,
+	__MiniflareFunctionWrapper,
 	createHTTPReducers,
 	createHTTPRevivers,
 	parseWithReadableStreams,
+	PlatformImpl,
+	ReducersRevivers,
 	stringifyWithStreams,
 	structuredSerializableReducers,
 	structuredSerializableRevivers,
@@ -52,14 +54,56 @@ const objectProtoNames = Object.getOwnPropertyNames(Object.prototype)
 	.join("\0");
 function isPlainObject(value: unknown) {
 	const proto = Object.getPrototypeOf(value);
+	if (value?.constructor?.name === "RpcStub") {
+		return false;
+	}
+	if (isObject(value)) {
+		const valueAsRecord = value as Record<string, unknown>;
+		if (objectContainsFunctions(valueAsRecord)) {
+			return false;
+		}
+	}
 	return (
 		proto === Object.prototype ||
 		proto === null ||
 		Object.getOwnPropertyNames(proto).sort().join("\0") === objectProtoNames
 	);
 }
+function objectContainsFunctions(
+	obj: Record<string | symbol, unknown>
+): boolean {
+	const propertyNames = Object.getOwnPropertyNames(obj);
+	const propertySymbols = Object.getOwnPropertySymbols(obj);
+	const properties = [...propertyNames, ...propertySymbols];
+
+	for (const property of properties) {
+		const entry = obj[property];
+		if (typeof entry === "function") {
+			return true;
+		}
+		if (
+			isObject(entry) &&
+			objectContainsFunctions(entry as Record<string, unknown>)
+		) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+function isObject(
+	value: unknown
+): value is Record<string | number | symbol, unknown> {
+	return !!value && typeof value === "object";
+}
+
 function getType(value: unknown) {
 	return Object.prototype.toString.call(value).slice(8, -1); // `[object <type>]`
+}
+
+function isInternal(value: unknown) {
+	return isObject(value) && value[Symbol.for("cloudflare:internal-class")];
 }
 
 type Env = Record<string, unknown> & {
@@ -82,11 +126,16 @@ export class ProxyServer implements DurableObject {
 			// should only ever return `Object`, as none override `Symbol.toStringTag`
 			// https://tc39.es/ecma262/multipage/fundamental-objects.html#sec-object.prototype.tostring
 			const type = getType(value);
-			if ((type === "Object" && !isPlainObject(value)) || type === "Promise") {
+			if (
+				((type === "Object" || isInternal(value)) && !isPlainObject(value)) ||
+				type === "Promise"
+			) {
 				const address = this.nextHeapAddress++;
 				this.heap.set(address, value);
-				assert(typeof value === "object" && value !== null);
-				return [address, value.constructor.name];
+				assert(value !== null);
+				const name = value?.constructor.name;
+				const isFunction = value instanceof __MiniflareFunctionWrapper;
+				return [address, name, isFunction];
 			}
 		},
 	};
@@ -190,6 +239,10 @@ export class ProxyServer implements DurableObject {
 		if (opHeader === ProxyOps.GET) {
 			// If no key header is specified, just return the target
 			result = keyHeader === null ? target : target[keyHeader];
+
+			// Immediately resolve all RpcProperties
+			if (result?.constructor.name === "RpcProperty") result = await result;
+
 			if (typeof result === "function") {
 				// Calling functions-which-return-functions not yet supported
 				return new Response(null, {
@@ -210,9 +263,7 @@ export class ProxyServer implements DurableObject {
 		} else if (opHeader === ProxyOps.GET_OWN_KEYS) {
 			result = Object.getOwnPropertyNames(target);
 		} else if (opHeader === ProxyOps.CALL) {
-			// We don't allow callable targets yet (could be useful to implement if
-			// we ever need to proxy functions that return functions)
-			if (keyHeader === null) return new Response(null, { status: 400 });
+			assert(keyHeader !== null);
 			const func = target[keyHeader];
 			assert(typeof func === "function");
 
@@ -255,7 +306,21 @@ export class ProxyServer implements DurableObject {
 			}
 			assert(Array.isArray(args));
 			try {
-				result = func.apply(target, args);
+				// See #createMediaProxy() for why this is special
+				if (isImagesInput(targetName, keyHeader)) {
+					let transform = func.apply(target, [args[0]]);
+					for (const operation of args[1]) {
+						transform = transform[operation.type](...operation.arguments);
+					}
+					// We intentionally don't await this `output()` call so that it's treated as a regular promise
+					result = transform.output(args[2]);
+				} else if (["RpcProperty", "RpcStub"].includes(func.constructor.name)) {
+					// let's resolve RpcPromise instances right away (to support serialization)
+					result = await func(...args);
+				} else {
+					result = func.apply(target, args);
+				}
+
 				// See `isR2ObjectWriteHttpMetadata()` comment for why this special
 				if (isR2ObjectWriteHttpMetadata(targetName, keyHeader)) {
 					result = args[0];

@@ -1,9 +1,8 @@
-/* eslint-disable @typescript-eslint/ban-types */
+/* eslint-disable @typescript-eslint/no-unsafe-function-type */
 import assert from "assert";
 import crypto from "crypto";
 import { ReadableStream, TransformStream } from "stream/web";
 import util from "util";
-import type { ServiceWorkerGlobalScope } from "@cloudflare/workers-types/experimental";
 import { stringify } from "devalue";
 import { Headers } from "undici";
 import { DispatchFetch, Request, Response } from "../../../http";
@@ -11,24 +10,34 @@ import { prefixStream, readPrefix } from "../../../shared";
 import {
 	Awaitable,
 	CoreHeaders,
-	ProxyAddresses,
-	ProxyOps,
-	ReducersRevivers,
-	StringifiedWithStream,
 	createHTTPReducers,
 	createHTTPRevivers,
 	isFetcherFetch,
 	isR2ObjectWriteHttpMetadata,
 	parseWithReadableStreams,
+	ProxyAddresses,
+	ProxyOps,
+	ReducersRevivers,
+	StringifiedWithStream,
 	stringifyWithStreams,
 	structuredSerializableReducers,
 	structuredSerializableRevivers,
 } from "../../../workers";
 import { DECODER, SynchronousFetcher, SynchronousResponse } from "./fetch-sync";
 import { NODE_PLATFORM_IMPL } from "./types";
+import type {
+	ImageDrawOptions,
+	ImageOutputOptions,
+	ImagesBinding,
+	ImageTransform,
+	ImageTransformationResult,
+	ImageTransformer,
+	ServiceWorkerGlobalScope,
+} from "@cloudflare/workers-types/experimental";
 
 const kAddress = Symbol("kAddress");
 const kName = Symbol("kName");
+const kIsFunction = Symbol("kIsFunction");
 interface NativeTarget {
 	// `kAddress` is used as a brand for `NativeTarget`. Pointer to the "heap"
 	// map in the `ProxyServer` Durable Object.
@@ -36,26 +45,37 @@ interface NativeTarget {
 	// Use `Symbol` for name too, so we can use it as a unique property key in
 	// `ProxyClientHandler`. Usually the `.constructor.name` of the object.
 	[kName]: string;
+	// Use `Symbol` for isFunction too, so we can use it as a unique property key in
+	// `ProxyClientHandler`. This is a field needed because we need to treat functions ad-hoc.
+	[kIsFunction]: boolean;
 }
 function isNativeTarget(value: unknown): value is NativeTarget {
-	return typeof value === "object" && value !== null && kAddress in value;
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		kAddress in value &&
+		kIsFunction in value
+	);
 }
 
 // Special targets for objects automatically added to the `ProxyServer` "heap"
 const TARGET_GLOBAL: NativeTarget = {
 	[kAddress]: ProxyAddresses.GLOBAL,
 	[kName]: "global",
+	[kIsFunction]: false,
 };
 const TARGET_ENV: NativeTarget = {
 	[kAddress]: ProxyAddresses.ENV,
 	[kName]: "env",
+	[kIsFunction]: false,
 };
 
 const reducers: ReducersRevivers = {
 	...structuredSerializableReducers,
 	...createHTTPReducers(NODE_PLATFORM_IMPL),
 	Native(value) {
-		if (isNativeTarget(value)) return [value[kAddress], value[kName]];
+		if (isNativeTarget(value))
+			return [value[kAddress], value[kName], value[kIsFunction]];
 	},
 };
 const revivers: ReducersRevivers = {
@@ -139,7 +159,7 @@ class ProxyClientBridge {
 	// of TCP connections to `workerd` in `dispatchFetch()` for all the concurrent
 	// requests.
 	readonly #finalizeBatch: NativeTargetHeldValue[] = [];
-	#finalizeBatchTimeout?: NodeJS.Timeout;
+	#finalizeBatchTimeout?: ReturnType<typeof setTimeout>;
 
 	readonly sync = new SynchronousFetcher();
 
@@ -191,10 +211,22 @@ class ProxyClientBridge {
 
 	getProxy<T extends object>(target: NativeTarget): T {
 		const handler = new ProxyStubHandler(this, target);
-		const proxy = new Proxy<T>(
-			{ [util.inspect.custom]: handler.inspect } as T,
-			handler
-		);
+
+		type WithCustomInspect<T> = T & {
+			[util.inspect.custom]?: unknown;
+		};
+		let proxyTarget: WithCustomInspect<object | Function>;
+		if (target[kIsFunction]) {
+			// the proxy target needs to be a function so that the consumer of the proxy
+			// can simply call it (if we didn't do this consumers would get a
+			// `x is not a function` type error)
+			proxyTarget = new Function();
+		} else {
+			proxyTarget = {};
+		}
+		proxyTarget[util.inspect.custom] = handler.inspect;
+		const proxy = new Proxy<T>(proxyTarget as T, handler);
+
 		const held: NativeTargetHeldValue = {
 			address: target[kAddress],
 			version: this.#version,
@@ -218,7 +250,10 @@ class ProxyClientBridge {
 	}
 }
 
-class ProxyStubHandler<T extends object> implements ProxyHandler<T> {
+class ProxyStubHandler<T extends object>
+	extends Function
+	implements ProxyHandler<T>
+{
 	readonly #version: number;
 	readonly #stringifiedTarget: string;
 	readonly #knownValues = new Map<string, unknown>();
@@ -232,10 +267,15 @@ class ProxyStubHandler<T extends object> implements ProxyHandler<T> {
 		...revivers,
 		Native: (value) => {
 			assert(Array.isArray(value));
-			const [address, name] = value as unknown[];
+			const [address, name, isFunction] = value as unknown[];
 			assert(typeof address === "number");
 			assert(typeof name === "string");
-			const target: NativeTarget = { [kAddress]: address, [kName]: name };
+			assert(typeof isFunction === "boolean");
+			const target: NativeTarget = {
+				[kAddress]: address,
+				[kName]: name,
+				[kIsFunction]: isFunction,
+			};
 			if (name === "Promise") {
 				// We'll only see `Promise`s here if we're parsing from
 				// `#parseSyncResponse`. In that case, we'll want to make an async fetch
@@ -250,16 +290,74 @@ class ProxyStubHandler<T extends object> implements ProxyHandler<T> {
 				});
 				return this.#parseAsyncResponse(resPromise);
 			} else {
+				// See #createMediaProxy() for why this is special
+				if (name === "ImagesBindingImpl") {
+					return this.#createMediaProxy(target);
+				}
 				// Otherwise, return a `Proxy` for this target
 				return this.bridge.getProxy(target);
 			}
 		},
 	};
+	/**
+	 * Images bindings are some of the most complex bindings from an API perspective, other than RPC. In particular, they expose a _synchronous_ API that accepts ReadableStream arguments.
+	 * Multiple synchronous APIs are chained together in a builder pattern (e.g. `await env.IMAGES.input(stream).transform(...).output(...)`) before the final `.output()` call is awaited.
+	 * This breaks our assumptions around functions that accept ReadableStream arguments always being async, and so doesn't work without some special casing.
+	 *
+	 * Ref: https://developers.cloudflare.com/images/transform-images/bindings/
+	 */
+	#createMediaProxy(target: NativeTarget) {
+		type Operation = {
+			type: "transform" | "draw";
+			arguments: unknown[];
+		};
+		const transformer = (
+			target: {
+				input: (
+					stream: ReadableStream,
+					operations: Operation[],
+					options: ImageOutputOptions
+				) => ImageTransformationResult;
+			},
+			stream: ReadableStream,
+			operations: Operation[]
+		): ImageTransformer => {
+			return {
+				transform: (transform: ImageTransform): ImageTransformer => {
+					return transformer(target, stream, [
+						...operations,
+						{ type: "transform", arguments: [transform] },
+					]);
+				},
+				draw: (image: ImageTransformer, options?: ImageDrawOptions) => {
+					return transformer(target, stream, [
+						...operations,
+						{ type: "draw", arguments: [image, options] },
+					]);
+				},
+				output: async (options: ImageOutputOptions) => {
+					// This signature doesn't exist on the production binding, but will be intercepted in the proxy server
+					return await target.input(stream, operations, options);
+				},
+			};
+		};
+		const binding = {
+			info: (stream: ReadableStream<Uint8Array>) => {
+				// @ts-expect-error The stream types are mismatched
+				return (this.bridge.getProxy(target) as ImagesBinding)["info"](stream);
+			},
+			input: (stream: ReadableStream<Uint8Array>) => {
+				return transformer(this.bridge.getProxy(target), stream, []);
+			},
+		};
+		return binding;
+	}
 
 	constructor(
 		readonly bridge: ProxyClientBridge,
 		readonly target: NativeTarget
 	) {
+		super();
 		this.#version = bridge.version;
 		this.#stringifiedTarget = stringify(this.target, reducers);
 	}
@@ -359,6 +457,21 @@ class ProxyStubHandler<T extends object> implements ProxyHandler<T> {
 		return this.#maybeThrow(syncRes, result, caller);
 	}
 
+	#thisFnKnownAsync = false;
+
+	apply(_target: T, ...args: unknown[]) {
+		const result = this.#call(
+			"__miniflareWrappedFunction",
+			this.#thisFnKnownAsync,
+			args[1] as unknown[],
+			this as Function
+		);
+		if (!this.#thisFnKnownAsync && result instanceof Promise) {
+			this.#thisFnKnownAsync = true;
+		}
+		return result;
+	}
+
 	get(_target: T, key: string | symbol, _receiver: unknown) {
 		this.#assertSafe();
 
@@ -366,6 +479,7 @@ class ProxyStubHandler<T extends object> implements ProxyHandler<T> {
 		// (allows native proxies to be used as arguments, e.g. `DurableObjectId`s)
 		if (key === kAddress) return this.target[kAddress];
 		if (key === kName) return this.target[kName];
+		if (key === kIsFunction) return this.target[kIsFunction];
 		// Ignore all other symbol properties, or `then()`s. We should never return
 		// `Promise`s or thenables as native targets, and want to avoid the extra
 		// network call when `await`ing the proxy.
@@ -503,7 +617,7 @@ class ProxyStubHandler<T extends object> implements ProxyHandler<T> {
 		this.#assertSafe();
 
 		const targetName = this.target[kName];
-		// See `isFetcherFetch()` comment for why this special
+		// See `isFetcherFetch()` comment for why this is special
 		if (isFetcherFetch(targetName, key)) return this.#fetcherFetchCall(args);
 
 		const stringified = stringifyWithStreams(

@@ -1,8 +1,8 @@
 interface UnsafeEval {
 	eval(code: string, name?: string): unknown;
-	// eslint-disable-next-line @typescript-eslint/ban-types
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 	newFunction(script: string, name?: string, ...args: string[]): Function;
-	// eslint-disable-next-line @typescript-eslint/ban-types
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 	newAsyncFunction(script: string, name?: string, ...args: string[]): Function;
 }
 
@@ -18,6 +18,7 @@ interface Env {
 	__VITEST_POOL_WORKERS_RUNNER_OBJECT: EphemeralObjectNamespace<"singleton">;
 	__VITEST_POOL_WORKERS_UNSAFE_EVAL: UnsafeEval;
 }
+type InternalUserEnv = Env & Record<string, unknown>;
 
 interface DurableObjectDesignator {
 	className: string;

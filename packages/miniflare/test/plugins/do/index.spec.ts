@@ -5,11 +5,11 @@ import { setTimeout } from "timers/promises";
 import test from "ava";
 import {
 	DeferredPromise,
+	kUnsafeEphemeralUniqueKey,
 	MessageEvent,
 	Miniflare,
 	MiniflareOptions,
 	RequestInit,
-	kUnsafeEphemeralUniqueKey,
 } from "miniflare";
 import { useTmp } from "../../test-shared";
 
@@ -383,6 +383,75 @@ test("prevent Durable Object eviction", async (t) => {
 	t.is(await res.text(), original);
 });
 
+const MINIFLARE_WITH_SQLITE = (useSQLite: boolean) =>
+	new Miniflare({
+		verbose: true,
+		modules: true,
+		script: `export class SQLiteDurableObject {
+			constructor(ctx) { this.ctx = ctx; }
+			fetch() {
+				try {
+					return new Response(this.ctx.storage.sql.databaseSize);
+				} catch (error) {
+					if (error instanceof Error) {
+						return new Response(error.message);
+					}
+					throw error;
+				}
+			}
+		}
+		export default {
+			fetch(req, env, ctx) {
+				const id = env.SQLITE_DURABLE_OBJECT.idFromName("foo");
+				console.log({id})
+				const stub = env.SQLITE_DURABLE_OBJECT.get(id);
+				return stub.fetch(req);
+			}
+		}`,
+		durableObjects: {
+			SQLITE_DURABLE_OBJECT: {
+				className: "SQLiteDurableObject",
+				useSQLite,
+			},
+		},
+	});
+
+test("SQLite is available in SQLite backed Durable Objects", async (t) => {
+	const mf = MINIFLARE_WITH_SQLITE(true);
+	t.teardown(() => mf.dispose());
+
+	let res = await mf.dispatchFetch("http://localhost");
+	t.is(await res.text(), "4096");
+
+	const ns = await mf.getDurableObjectNamespace("SQLITE_DURABLE_OBJECT");
+	const id = ns.newUniqueId();
+	const stub = ns.get(id);
+	res = await stub.fetch("http://localhost");
+	t.is(await res.text(), "4096");
+});
+
+test("SQLite is not available in default Durable Objects", async (t) => {
+	const mf = MINIFLARE_WITH_SQLITE(false);
+	t.teardown(() => mf.dispose());
+
+	let res = await mf.dispatchFetch("http://localhost");
+	t.assert(
+		(await res.text()).startsWith(
+			"SQL is not enabled for this Durable Object class."
+		)
+	);
+
+	const ns = await mf.getDurableObjectNamespace("SQLITE_DURABLE_OBJECT");
+	const id = ns.newUniqueId();
+	const stub = ns.get(id);
+	res = await stub.fetch("http://localhost");
+	t.assert(
+		(await res.text()).startsWith(
+			"SQL is not enabled for this Durable Object class."
+		)
+	);
+});
+
 test("colo-local actors", async (t) => {
 	const mf = new Miniflare({
 		modules: true,
@@ -412,4 +481,125 @@ test("colo-local actors", async (t) => {
 	const stub = ns.get("thing2");
 	res = await stub.fetch("http://localhost");
 	t.is(await res.text(), "body:thing2");
+});
+
+test("multiple workers with DO conflicting useSQLite booleans cause options error", async (t) => {
+	const mf = new Miniflare({
+		workers: [
+			{
+				modules: true,
+				name: "worker-a",
+				script: "export default {}",
+			},
+		],
+	});
+
+	t.teardown(() => mf.dispose());
+
+	await t.throwsAsync(
+		async () => {
+			await mf.setOptions({
+				workers: [
+					{
+						modules: true,
+						name: "worker-c",
+						script: "export default {}",
+						durableObjects: {
+							MY_DO: {
+								className: "MyDo",
+								scriptName: "worker-a",
+								useSQLite: false,
+							},
+						},
+					},
+					{
+						modules: true,
+						name: "worker-a",
+						script: `
+							import { DurableObject } from "cloudflare:workers";
+
+							export class MyDo extends DurableObject {}
+
+							export default { }
+						`,
+						durableObjects: {
+							MY_DO: {
+								className: "MyDo",
+								scriptName: undefined,
+								useSQLite: true,
+							},
+						},
+					},
+					{
+						modules: true,
+						name: "worker-b",
+						script: "export default {}",
+						durableObjects: {
+							MY_DO: {
+								className: "MyDo",
+								scriptName: "worker-a",
+								useSQLite: false,
+							},
+						},
+					},
+				],
+			});
+		},
+		{
+			instanceOf: Error,
+			message:
+				'Different storage backends defined for Durable Object "MyDo" in "core:user:worker-a": false and true',
+		}
+	);
+});
+
+test("multiple workers with DO useSQLite true and undefined does not cause options error", async (t) => {
+	const mf = new Miniflare({
+		workers: [
+			{
+				modules: true,
+				name: "worker-a",
+				script: "export default {}",
+			},
+		],
+	});
+
+	t.teardown(() => mf.dispose());
+
+	await t.notThrowsAsync(async () => {
+		await mf.setOptions({
+			workers: [
+				{
+					modules: true,
+					name: "worker-a",
+					script: `
+							import { DurableObject } from "cloudflare:workers";
+
+							export class MyDo extends DurableObject {}
+
+							export default { }
+						`,
+					durableObjects: {
+						MY_DO: {
+							className: "MyDo",
+							scriptName: undefined,
+							useSQLite: true,
+						},
+					},
+				},
+				{
+					modules: true,
+					name: "worker-b",
+					script: "export default {}",
+					durableObjects: {
+						MY_DO: {
+							className: "MyDo",
+							scriptName: "worker-a",
+							useSQLite: undefined,
+						},
+					},
+				},
+			],
+		});
+	});
 });

@@ -26,7 +26,9 @@ export function mayContainMultipleStatements(sql: string): boolean {
  */
 export default function splitSqlQuery(sql: string): string[] {
 	const trimmedSql = trimSqlQuery(sql);
-	if (!mayContainMultipleStatements(trimmedSql)) return [trimmedSql];
+	if (!mayContainMultipleStatements(trimmedSql)) {
+		return [trimmedSql];
+	}
 	const split = splitSqlIntoStatements(trimmedSql);
 	if (split.length === 0) {
 		return [trimmedSql];
@@ -65,21 +67,25 @@ function splitSqlIntoStatements(sql: string): string[] {
 				break;
 			}
 			case `-`:
-				str += char;
 				next = iterator.next();
 				if (!next.done && next.value === "-") {
-					str += next.value + consumeUntilMarker(iterator, "\n");
+					// Skip to the end of the comment
+					consumeUntilMarker(iterator, "\n");
+					// Maintain the newline character
+					str += "\n";
 					break;
 				} else {
+					str += char;
 					continue;
 				}
 			case `/`:
-				str += char;
 				next = iterator.next();
 				if (!next.done && next.value === "*") {
-					str += next.value + consumeUntilMarker(iterator, "*/");
+					// Skip to the end of the comment
+					consumeUntilMarker(iterator, "*/");
 					break;
 				} else {
+					str += char;
 					continue;
 				}
 			case `;`:
@@ -153,7 +159,7 @@ function isDollarQuoteIdentifier(str: string) {
  * Returns true if the `str` ends with a compound statement `BEGIN` or `CASE` marker.
  */
 function isCompoundStatementStart(str: string) {
-	return /\s(BEGIN|CASE)\s$/.test(str);
+	return /\s(BEGIN|CASE)\s$/i.test(str);
 }
 
 /**

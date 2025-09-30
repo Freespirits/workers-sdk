@@ -4,18 +4,16 @@ import { UserError } from "../../errors";
 import { isValidIdentifier, normalizeIdentifier } from "./identifiers";
 import type { UrlPath } from "../../paths";
 
-export const HTTP_METHODS = [
-	"HEAD",
-	"OPTIONS",
-	"GET",
-	"POST",
-	"PUT",
-	"PATCH",
-	"DELETE",
-] as const;
-export type HTTPMethod = typeof HTTP_METHODS[number];
+export type HTTPMethod =
+	| "HEAD"
+	| "OPTIONS"
+	| "GET"
+	| "POST"
+	| "PUT"
+	| "PATCH"
+	| "DELETE";
 
-export type RoutesCollection = Array<{
+type RoutesCollection = Array<{
 	routePath: UrlPath;
 	mountPath: UrlPath;
 	method?: HTTPMethod;
@@ -64,7 +62,7 @@ export async function writeRoutesModule({
 	return outfile;
 }
 
-export function parseConfig(config: Config, baseDir: string) {
+function parseConfig(config: Config, baseDir: string) {
 	const routes: RoutesCollection = [];
 	const importMap: ImportMap = new Map();
 	const identifierCount = new Map<string, number>(); // to keep track of identifier collisions
@@ -125,10 +123,7 @@ export function parseConfig(config: Config, baseDir: string) {
 	return { routes, importMap };
 }
 
-export function generateRoutesModule(
-	importMap: ImportMap,
-	routes: RoutesCollection
-) {
+function generateRoutesModule(importMap: ImportMap, routes: RoutesCollection) {
 	return `${[...importMap.values()]
 		.map(
 			({ filepath, name, identifier }) =>

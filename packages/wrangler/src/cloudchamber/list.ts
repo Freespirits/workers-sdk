@@ -10,20 +10,28 @@ import {
 	yellow,
 } from "@cloudflare/cli/colors";
 import { inputPrompt, spinner } from "@cloudflare/cli/interactive";
-import isInteractive from "../is-interactive";
+import {
+	DeploymentsService,
+	PlacementsService,
+} from "@cloudflare/containers-shared";
+import { isNonInteractiveOrCI } from "../is-interactive";
+import { logger } from "../logger";
 import { listDeploymentsAndChoose, loadDeployments } from "./cli/deployments";
-import { statusToColored } from "./cli/util";
-import { DeploymentsService, PlacementsService } from "./client";
-import { loadAccountSpinner, promiseSpinner } from "./common";
+import { capitalize, statusToColored } from "./cli/util";
+import { promiseSpinner } from "./common";
 import type { Config } from "../config";
 import type {
-	CommonYargsArgvJSON,
-	StrictYargsOptionsToInterfaceJSON,
+	CommonYargsArgv,
+	StrictYargsOptionsToInterface,
 } from "../yargs-types";
-import type { PlacementEvent, PlacementWithEvents, State } from "./client";
 import type { EventName } from "./enums";
+import type {
+	DeploymentPlacementState,
+	PlacementEvent,
+	PlacementWithEvents,
+} from "@cloudflare/containers-shared";
 
-export function listDeploymentsYargs(args: CommonYargsArgvJSON) {
+export function listDeploymentsYargs(args: CommonYargsArgv) {
 	return args
 		.option("location", {
 			requiresArg: true,
@@ -49,6 +57,13 @@ export function listDeploymentsYargs(args: CommonYargsArgvJSON) {
 			demandOption: false,
 			describe: "Filter deployments by ipv4 address",
 		})
+		.option("label", {
+			requiresArg: true,
+			type: "array",
+			demandOption: false,
+			describe: "Filter deployments by labels",
+			coerce: (arg: unknown[]) => arg.map((a) => a?.toString() ?? ""),
+		})
 		.positional("deploymentIdPrefix", {
 			describe:
 				"Optional deploymentId to filter deployments\nThis means that 'list' will only showcase deployments that contain this ID prefix",
@@ -57,40 +72,33 @@ export function listDeploymentsYargs(args: CommonYargsArgvJSON) {
 }
 
 export async function listCommand(
-	deploymentArgs: StrictYargsOptionsToInterfaceJSON<
-		typeof listDeploymentsYargs
-	>,
+	deploymentArgs: StrictYargsOptionsToInterface<typeof listDeploymentsYargs>,
 	config: Config
 ) {
-	await loadAccountSpinner(deploymentArgs);
 	const prefix = (deploymentArgs.deploymentIdPrefix ?? "") as string;
-	if (deploymentArgs.json || !isInteractive()) {
+	if (isNonInteractiveOrCI()) {
 		const deployments = (
 			await DeploymentsService.listDeploymentsV2(
+				undefined,
 				deploymentArgs.location,
 				deploymentArgs.image,
-				deploymentArgs.state as State,
-				deploymentArgs.ipv4
+				deploymentArgs.state as DeploymentPlacementState,
+				deploymentArgs.ipv4,
+				deploymentArgs.label
 			)
 		).filter((deployment) => deployment.id.startsWith(prefix));
 		if (deployments.length === 1) {
 			const placements = await PlacementsService.listPlacements(
 				deployments[0].id
 			);
-			console.log(
-				JSON.stringify(
-					{
-						...deployments[0],
-						placements,
-					},
-					null,
-					4
-				)
-			);
+			logger.json({
+				...deployments[0],
+				placements,
+			});
 			return;
 		}
 
-		console.log(JSON.stringify(deployments, null, 4));
+		logger.json(deployments);
 		return;
 	}
 
@@ -102,6 +110,7 @@ export async function listCommand(
  */
 function eventMessage(event: PlacementEvent, lastEvent: boolean): string {
 	let { message } = event;
+	message = capitalize(message);
 	const name = event.name as EventName;
 	const health = event.statusChange["health"];
 	if (health === "failed") {
@@ -121,7 +130,7 @@ function eventMessage(event: PlacementEvent, lastEvent: boolean): string {
 
 const listCommandHandle = async (
 	deploymentIdPrefix: string,
-	args: StrictYargsOptionsToInterfaceJSON<typeof listDeploymentsYargs>,
+	args: StrictYargsOptionsToInterface<typeof listDeploymentsYargs>,
 	_config: Config
 ) => {
 	const keepListIter = true;
@@ -163,10 +172,13 @@ const listCommandHandle = async (
 			onRefresh: async () => {
 				start("Refreshing placements");
 				const options = (await loadPlacements()).map(placementToOptions);
-				if (refresh) return [];
+				if (refresh) {
+					return [];
+				}
 				stop();
-				if (options.length)
+				if (options.length) {
 					options[0].label += ", last refresh: " + new Date().toLocaleString();
+				}
 				return options;
 			},
 		});

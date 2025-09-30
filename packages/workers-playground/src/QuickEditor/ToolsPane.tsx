@@ -2,11 +2,12 @@ import { Icon } from "@cloudflare/component-icon";
 import { A, Div } from "@cloudflare/elements";
 import { isDarkMode, theme } from "@cloudflare/style-const";
 import { createComponent } from "@cloudflare/style-container";
+import { SplitPane } from "@cloudflare/workers-editor-shared";
 import { useState } from "react";
 import DevtoolsIframe from "./DevtoolsIframe";
 import { HTTPTab } from "./HTTPTab/HTTPTab";
+import MigrateToWrangler from "./MigrateToWrangler/MigrateToWrangler";
 import PreviewTab from "./PreviewTab/PreviewTab";
-import SplitPane from "./SplitPane";
 import { Tab, TabBar, TabList, TabPanel, Tabs } from "./TabBar";
 
 const Main = createComponent(() => ({
@@ -41,6 +42,9 @@ export default function ToolsPane() {
 									<Icon type="two-way" mr={2} />
 									HTTP
 								</Tab>
+								<Tab>
+									<Icon type="wrangler" />
+								</Tab>
 							</TabList>
 							<Div
 								display="flex"
@@ -69,7 +73,7 @@ export default function ToolsPane() {
 									title="Join Cloudflare’s developer Discord"
 									target="_blank"
 									display={"inline-flex"}
-									href={`https://discord.gg/cloudflaredev`}
+									href={`https://discord.cloudflare.com`}
 								>
 									<Icon
 										type="discord"
@@ -89,6 +93,9 @@ export default function ToolsPane() {
 						)}
 						<TabPanel>
 							<HTTPTab />
+						</TabPanel>
+						<TabPanel scrollable>
+							<MigrateToWrangler />
 						</TabPanel>
 					</Tabs>
 				</Main>

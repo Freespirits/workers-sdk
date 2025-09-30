@@ -4,40 +4,52 @@
 		"signature": true
 	},
 	"globalEnv": ["CI_OS", "NODE_VERSION"],
-	"pipeline": {
-		"wrangler#dev": {
+	"globalPassThroughEnv": [
+		"NODE_EXTRA_CA_CERTS",
+		"CI",
+		"VSCODE_INSPECTOR_OPTIONS",
+		"WRANGLER_LOG_PATH",
+		"TEST_REPORT_PATH",
+		"CLOUDFLARE_CONTAINER_REGISTRY",
+		"DOCKER_HOST",
+		"WRANGLER_DOCKER_HOST",
+		"WRANGLER_API_ENVIRONMENT"
+	],
+	"tasks": {
+		"dev": {
 			"persistent": true,
 			"cache": false
 		},
-		"miniflare#dev": {
-			"persistent": true,
-			"cache": false
-		},
-		"@cloudflare/vitest-pool-workers#dev": {
-			"persistent": true,
-			"cache": false
-		},
-		"build": { "dependsOn": ["^build"] },
-		"test": {
+		"build": {
 			"dependsOn": ["^build"],
-			"cache": false
+			"outputLogs": "new-only"
+		},
+		"test": {
+			"dependsOn": ["build"]
 		},
 		"test:watch": {
+			"persistent": true,
 			"cache": false
 		},
 		"check:lint": {
-			"dependsOn": ["^topological"]
+			"dependsOn": ["^check:lint"]
 		},
 		"check:type": {
-			"dependsOn": ["^topological"]
+			"dependsOn": ["build"]
 		},
-		"topological": {
-			"dependsOn": ["^topological"]
+		"type:tests": {
+			"dependsOn": ["build"]
 		},
-		"type:tests": {},
 		"test:ci": {
-			"cache": false
+			"dependsOn": ["build"],
+			"outputLogs": "new-only"
 		},
-		"//#check:format": { "cache": true }
+		"test:e2e": {
+			"dependsOn": ["build"],
+			"outputLogs": "new-only"
+		},
+		"//#check:format": {
+			"cache": true
+		}
 	}
 }

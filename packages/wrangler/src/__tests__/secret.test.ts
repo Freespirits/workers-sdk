@@ -1,10 +1,10 @@
-import { Blob } from "node:buffer";
 import * as fs from "node:fs";
 import { writeFileSync } from "node:fs";
 import readline from "node:readline";
 import * as TOML from "@iarna/toml";
-import { MockedRequest, rest } from "msw";
-import { FormData } from "undici";
+import { http, HttpResponse } from "msw";
+import { vi } from "vitest";
+import { VERSION_NOT_DEPLOYED_ERR_CODE } from "../secret";
 import { mockAccountId, mockApiToken } from "./helpers/mock-account-id";
 import { mockConsoleMethods } from "./helpers/mock-console";
 import { clearDialogs, mockConfirm, mockPrompt } from "./helpers/mock-dialogs";
@@ -12,16 +12,19 @@ import { useMockIsTTY } from "./helpers/mock-istty";
 import { mockGetMembershipsFail } from "./helpers/mock-oauth-flow";
 import { useMockStdin } from "./helpers/mock-stdin";
 import { msw } from "./helpers/msw";
-import { FileReaderSync } from "./helpers/msw/read-file-sync";
 import { runInTempDir } from "./helpers/run-in-tmp";
 import { runWrangler } from "./helpers/run-wrangler";
-import type { RestRequest } from "msw";
+import { writeWranglerConfig } from "./helpers/write-wrangler-config";
 import type { Interface } from "node:readline";
 
-function createFetchResult(result: unknown, success = true) {
+function createFetchResult(
+	result: unknown,
+	success = true,
+	errors: { code: number; message: string }[] = []
+) {
 	return {
 		success,
-		errors: [],
+		errors,
 		messages: [],
 		result,
 	};
@@ -31,11 +34,55 @@ export function mockGetMemberships(
 	accounts: { id: string; account: { id: string; name: string } }[]
 ) {
 	msw.use(
-		rest.get("*/memberships", (req, res, ctx) => {
-			return res.once(ctx.json(createFetchResult(accounts)));
-		})
+		http.get(
+			"*/memberships",
+			() => {
+				return HttpResponse.json(createFetchResult(accounts));
+			},
+			{ once: true }
+		)
 	);
 }
+
+function mockNoWorkerFound(isBulk = false) {
+	if (isBulk) {
+		msw.use(
+			http.get(
+				"*/accounts/:accountId/workers/scripts/:scriptName/settings",
+				async () => {
+					return HttpResponse.json(
+						createFetchResult(null, false, [
+							{
+								code: 10007,
+								message: "This Worker does not exist on your account.",
+							},
+						])
+					);
+				},
+				{ once: true }
+			)
+		);
+	} else {
+		msw.use(
+			http.put(
+				"*/accounts/:accountId/workers/scripts/:scriptName/secrets",
+				async () => {
+					return HttpResponse.json(
+						createFetchResult(null, false, [
+							{
+								code: 10007,
+								message: "This Worker does not exist on your account.",
+							},
+						])
+					);
+				},
+				{ once: true }
+			)
+		);
+	}
+}
+
+vi.unmock("../wrangler-banner");
 
 describe("wrangler secret", () => {
 	const std = mockConsoleMethods();
@@ -51,31 +98,57 @@ describe("wrangler secret", () => {
 		function mockPutRequest(
 			input: { name: string; text: string },
 			env?: string,
-			legacyEnv = false
+			legacyEnv = false,
+			expectedScriptName = "script-name"
 		) {
 			const servicesOrScripts = env && !legacyEnv ? "services" : "scripts";
 			const environment = env && !legacyEnv ? "/environments/:envName" : "";
 			msw.use(
-				rest.put(
+				http.put(
 					`*/accounts/:accountId/workers/${servicesOrScripts}/:scriptName${environment}/secrets`,
-					async (req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-						expect(req.params.scriptName).toEqual(
-							legacyEnv && env ? `script-name-${env}` : "script-name"
+					async ({ request, params }) => {
+						expect(params.accountId).toEqual("some-account-id");
+						expect(params.scriptName).toEqual(
+							legacyEnv && env
+								? `${expectedScriptName}-${env}`
+								: expectedScriptName
 						);
 						if (!legacyEnv) {
-							expect(req.params.envName).toEqual(env);
+							expect(params.envName).toEqual(env);
 						}
-						const { name, text, type } = await req.json();
+						const { name, text, type } = (await request.json()) as Record<
+							string,
+							string
+						>;
 						expect(type).toEqual("secret_text");
 						expect(name).toEqual(input.name);
 						expect(text).toEqual(input.text);
 
-						return res.once(ctx.json(createFetchResult({ name, type })));
-					}
+						return HttpResponse.json(createFetchResult({ name, type }));
+					},
+					{ once: true }
 				)
 			);
 		}
+
+		it("should error helpfully if pages_build_output_dir is set", async () => {
+			fs.writeFileSync(
+				"wrangler.toml",
+				TOML.stringify({
+					pages_build_output_dir: "public",
+					name: "script-name",
+				}),
+				"utf-8"
+			);
+			await expect(
+				runWrangler("secret put secret-name")
+			).rejects.toThrowErrorMatchingInlineSnapshot(
+				`
+				[Error: It looks like you've run a Workers-specific command in a Pages project.
+				For Pages, please run \`wrangler pages secret put\` instead.]
+			`
+			);
+		});
 
 		describe("interactive", () => {
 			beforeEach(() => {
@@ -93,9 +166,12 @@ describe("wrangler secret", () => {
 				mockPutRequest({ name: `secret-name`, text: `hunter2` });
 				await runWrangler("secret put secret-name --name script-name");
 				expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secret for the Worker \\"script-name\\"
-			✨ Success! Uploaded secret secret-name"
-		`);
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					🌀 Creating the secret for the Worker \\"script-name\\"
+					✨ Success! Uploaded secret secret-name"
+				`);
 			});
 
 			it("should create a secret", async () => {
@@ -109,9 +185,12 @@ describe("wrangler secret", () => {
 				await runWrangler("secret put the-key --name script-name");
 
 				expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secret for the Worker \\"script-name\\"
-			✨ Success! Uploaded secret the-key"
-		`);
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					🌀 Creating the secret for the Worker \\"script-name\\"
+					✨ Success! Uploaded secret the-key"
+				`);
 				expect(std.err).toMatchInlineSnapshot(`""`);
 			});
 
@@ -132,9 +211,12 @@ describe("wrangler secret", () => {
 				);
 
 				expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secret for the Worker \\"script-name-some-env\\"
-			✨ Success! Uploaded secret the-key"
-		`);
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					🌀 Creating the secret for the Worker \\"script-name-some-env\\"
+					✨ Success! Uploaded secret the-key"
+				`);
 				expect(std.err).toMatchInlineSnapshot(`""`);
 			});
 
@@ -155,9 +237,12 @@ describe("wrangler secret", () => {
 				);
 
 				expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secret for the Worker \\"script-name\\" (some-env)
-			✨ Success! Uploaded secret the-key"
-		`);
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					🌀 Creating the secret for the Worker \\"script-name\\" (some-env)
+					✨ Success! Uploaded secret the-key"
+				`);
 				expect(std.err).toMatchInlineSnapshot(`""`);
 			});
 
@@ -168,15 +253,43 @@ describe("wrangler secret", () => {
 				} catch (e) {
 					error = e as Error;
 				}
-				expect(std.out).toMatchInlineSnapshot(`""`);
+				expect(std.out).toMatchInlineSnapshot(`
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					"
+				`);
 				expect(std.err).toMatchInlineSnapshot(`
-			"[31mX [41;31m[[41;97mERROR[41;31m][0m [1mRequired Worker name missing. Please specify the Worker name in wrangler.toml, or pass it as an argument with \`--name <worker-name>\`[0m
+					"[31mX [41;31m[[41;97mERROR[41;31m][0m [1mRequired Worker name missing. Please specify the Worker name in your Wrangler configuration file, or pass it as an argument with \`--name <worker-name>\`[0m
 
-			"
-		`);
+					"
+				`);
 				expect(error).toMatchInlineSnapshot(
-					`[Error: Required Worker name missing. Please specify the Worker name in wrangler.toml, or pass it as an argument with \`--name <worker-name>\`]`
+					`[Error: Required Worker name missing. Please specify the Worker name in your Wrangler configuration file, or pass it as an argument with \`--name <worker-name>\`]`
 				);
+			});
+
+			it("should ask to create a new Worker if no Worker is found under the provided name and abort if declined", async () => {
+				mockPrompt({
+					text: "Enter a secret value:",
+					options: { isSecret: true },
+					result: `hunter2`,
+				});
+				mockNoWorkerFound();
+				mockConfirm({
+					text: `There doesn't seem to be a Worker called "non-existent-worker". Do you want to create a new Worker with that name and add secrets to it?`,
+					result: false,
+				});
+				expect(
+					await runWrangler("secret put the-key --name non-existent-worker")
+				);
+				expect(std.out).toMatchInlineSnapshot(`
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					🌀 Creating the secret for the Worker \\"non-existent-worker\\"
+					Aborting. No secrets added."
+				`);
 			});
 		});
 
@@ -198,9 +311,12 @@ describe("wrangler secret", () => {
 				await runWrangler("secret put the-key --name script-name");
 
 				expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secret for the Worker \\"script-name\\"
-			✨ Success! Uploaded secret the-key"
-		`);
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					🌀 Creating the secret for the Worker \\"script-name\\"
+					✨ Success! Uploaded secret the-key"
+				`);
 				expect(std.warn).toMatchInlineSnapshot(`""`);
 				expect(std.err).toMatchInlineSnapshot(`""`);
 			});
@@ -212,9 +328,12 @@ describe("wrangler secret", () => {
 				await runWrangler("secret put the-key --name script-name");
 
 				expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secret for the Worker \\"script-name\\"
-			✨ Success! Uploaded secret the-key"
-		`);
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					🌀 Creating the secret for the Worker \\"script-name\\"
+					✨ Success! Uploaded secret the-key"
+				`);
 				expect(std.warn).toMatchInlineSnapshot(`""`);
 				expect(std.err).toMatchInlineSnapshot(`""`);
 			});
@@ -224,13 +343,50 @@ describe("wrangler secret", () => {
 				mockStdIn.throwError(new Error("Error in stdin stream"));
 				await expect(
 					runWrangler("secret put the-key --name script-name")
-				).rejects.toThrowErrorMatchingInlineSnapshot(`"Error in stdin stream"`);
+				).rejects.toThrowErrorMatchingInlineSnapshot(
+					`[Error: Error in stdin stream]`
+				);
 
 				expect(std.out).toMatchInlineSnapshot(`
-			          "
-			          [32mIf you think this is a bug then please create an issue at https://github.com/cloudflare/workers-sdk/issues/new/choose[0m"
-		        `);
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+
+					[32mIf you think this is a bug then please create an issue at https://github.com/cloudflare/workers-sdk/issues/new/choose[0m"
+				`);
 				expect(std.warn).toMatchInlineSnapshot(`""`);
+			});
+
+			it("should create a new worker if no worker is found under the provided name", async () => {
+				mockStdIn.send("hunter2");
+				mockNoWorkerFound();
+				msw.use(
+					http.put(
+						"*/accounts/:accountId/workers/scripts/:name",
+						async ({ params }) => {
+							expect(params.name).toEqual("non-existent-worker");
+							return HttpResponse.json(
+								createFetchResult({ name: params.name })
+							);
+						}
+					)
+				);
+				mockPutRequest(
+					{ name: "the-key", text: "hunter2" },
+					undefined,
+					undefined,
+					"non-existent-worker"
+				);
+				expect(
+					await runWrangler("secret put the-key --name non-existent-worker")
+				);
+				expect(std.out).toMatchInlineSnapshot(`
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					🌀 Creating the secret for the Worker \\"non-existent-worker\\"
+					✨ Success! Uploaded secret the-key"
+				`);
 			});
 
 			describe("with accountId", () => {
@@ -241,7 +397,7 @@ describe("wrangler secret", () => {
 					await expect(
 						runWrangler("secret put the-key --name script-name")
 					).rejects.toThrowErrorMatchingInlineSnapshot(
-						`"A request to the Cloudflare API (/memberships) failed."`
+						`[APIError: A request to the Cloudflare API (/memberships) failed.]`
 					);
 				});
 
@@ -249,9 +405,9 @@ describe("wrangler secret", () => {
 					mockGetMemberships([]);
 					await expect(runWrangler("secret put the-key --name script-name"))
 						.rejects.toThrowErrorMatchingInlineSnapshot(`
-				                  "Failed to automatically retrieve account IDs for the logged in user.
-				                  In a non-interactive environment, it is mandatory to specify an account ID, either by assigning its value to CLOUDFLARE_ACCOUNT_ID, or as \`account_id\` in your \`wrangler.toml\` file."
-			                `);
+						[Error: Failed to automatically retrieve account IDs for the logged in user.
+						In a non-interactive environment, it is mandatory to specify an account ID, either by assigning its value to CLOUDFLARE_ACCOUNT_ID, or as \`account_id\` in your Wrangler configuration file.]
+					`);
 				});
 
 				it("should use the account from wrangler.toml", async () => {
@@ -266,9 +422,12 @@ describe("wrangler secret", () => {
 					mockPutRequest({ name: "the-key", text: "the-secret" });
 					await runWrangler("secret put the-key --name script-name");
 					expect(std.out).toMatchInlineSnapshot(`
-				"🌀 Creating the secret for the Worker \\"script-name\\"
-				✨ Success! Uploaded secret the-key"
-			`);
+						"
+						 ⛅️ wrangler x.x.x
+						──────────────────
+						🌀 Creating the secret for the Worker \\"script-name\\"
+						✨ Success! Uploaded secret the-key"
+					`);
 					expect(std.warn).toMatchInlineSnapshot(`""`);
 					expect(std.err).toMatchInlineSnapshot(`""`);
 				});
@@ -291,15 +450,99 @@ describe("wrangler secret", () => {
 
 					await expect(runWrangler("secret put the-key --name script-name"))
 						.rejects.toThrowErrorMatchingInlineSnapshot(`
-				"More than one account available but unable to select one in non-interactive mode.
-				Please set the appropriate \`account_id\` in your \`wrangler.toml\` file.
-				Available accounts are (\`<name>\`: \`<account_id>\`):
-				  \`account-name-1\`: \`account-id-1\`
-				  \`account-name-2\`: \`account-id-2\`
-				  \`account-name-3\`: \`account-id-3\`"
-			`);
+						[Error: More than one account available but unable to select one in non-interactive mode.
+						Please set the appropriate \`account_id\` in your Wrangler configuration file or assign it to the \`CLOUDFLARE_ACCOUNT_ID\` environment variable.
+						Available accounts are (\`<name>\`: \`<account_id>\`):
+						  \`account-name-1\`: \`account-id-1\`
+						  \`account-name-2\`: \`account-id-2\`
+						  \`account-name-3\`: \`account-id-3\`]
+					`);
 				});
 			});
+
+			describe("multi-env warning", () => {
+				it("should warn if the wrangler config contains environments but none was specified in the command", async () => {
+					writeWranglerConfig({
+						env: {
+							test: {},
+						},
+					});
+					mockStdIn.send("the-secret");
+					mockPutRequest({ name: "the-key", text: "the-secret" });
+					await runWrangler("secret put the-key --name script-name");
+					expect(std.warn).toMatchInlineSnapshot(`
+						"[33m▲ [43;33m[[43;30mWARNING[43;33m][0m [1mMultiple environments are defined in the Wrangler configuration file, but no target environment was specified for the secret put command.[0m
+
+						  To avoid unintentional changes to the wrong environment, it is recommended to explicitly specify
+						  the target environment using the \`-e|--env\` flag.
+						  If your intention is to use the top-level environment of your configuration simply pass an empty
+						  string to the flag to target such environment. For example \`--env=\\"\\"\`.
+
+						"
+					`);
+				});
+
+				it("should not warn if the wrangler config contains environments and one was specified in the command", async () => {
+					writeWranglerConfig({
+						env: {
+							test: {},
+						},
+					});
+					mockStdIn.send("the-secret");
+					mockPutRequest({ name: "the-key", text: "the-secret" }, "test", true);
+					await runWrangler("secret put the-key --name script-name -e test");
+					expect(std.warn).toMatchInlineSnapshot(`""`);
+				});
+
+				it("should not warn if the wrangler config doesn't contain environments and none was specified in the command", async () => {
+					writeWranglerConfig();
+					mockStdIn.send("the-secret");
+					mockPutRequest({ name: "the-key", text: "the-secret" });
+					await runWrangler("secret put the-key --name script-name");
+					expect(std.warn).toMatchInlineSnapshot(`""`);
+				});
+			});
+		});
+
+		it("should error if the latest version is not deployed", async () => {
+			setIsTTY(true);
+
+			const scriptName = "test-script";
+
+			msw.use(
+				http.put(
+					`*/accounts/:accountId/workers/scripts/:scriptName/secrets`,
+					async ({ params }) => {
+						expect(params.accountId).toEqual("some-account-id");
+						expect(params.scriptName).toEqual(scriptName);
+
+						// Return our error
+						return HttpResponse.json(
+							createFetchResult(null, false, [
+								{
+									code: VERSION_NOT_DEPLOYED_ERR_CODE,
+									message: "latest is not deployed",
+								},
+							])
+						);
+					},
+					{ once: true }
+				)
+			);
+
+			mockPrompt({
+				text: "Enter a secret value:",
+				options: { isSecret: true },
+				result: `hunter2
+				`,
+			});
+
+			await expect(runWrangler(`secret put secret-name --name ${scriptName}`))
+				.rejects.toThrowErrorMatchingInlineSnapshot(`
+				[Error: Secret edit failed. You attempted to modify a secret, but the latest version of your Worker isn't currently deployed. Please ensure that the latest version of your Worker is fully deployed (wrangler versions deploy) before modifying secrets. Alternatively, you can use the Cloudflare dashboard to modify secrets and deploy the version.
+
+				Note: This limitation will be addressed in an upcoming release.]
+			`);
 		});
 	});
 
@@ -318,23 +561,42 @@ describe("wrangler secret", () => {
 			const servicesOrScripts = env && !legacyEnv ? "services" : "scripts";
 			const environment = env && !legacyEnv ? "/environments/:envName" : "";
 			msw.use(
-				rest.delete(
+				http.delete(
 					`*/accounts/:accountId/workers/${servicesOrScripts}/:scriptName${environment}/secrets/:secretName`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-						expect(req.params.scriptName).toEqual(
+					({ request, params }) => {
+						expect(params.accountId).toEqual("some-account-id");
+						expect(params.scriptName).toEqual(
 							legacyEnv && env ? `script-name-${env}` : "script-name"
 						);
-						if (!legacyEnv) {
-							if (env) {
-								expect(req.params.secretName).toEqual(input.secretName);
-							}
-						}
-						return res.once(ctx.json(createFetchResult(null)));
-					}
+						expect(params.secretName).toEqual(input.secretName);
+						expect(
+							new URL(request.url).searchParams.get("url_encoded")
+						).toEqual("true");
+						return HttpResponse.json(createFetchResult(null));
+					},
+					{ once: true }
 				)
 			);
 		}
+
+		it("should error helpfully if pages_build_output_dir is set", async () => {
+			fs.writeFileSync(
+				"wrangler.toml",
+				TOML.stringify({
+					pages_build_output_dir: "public",
+					name: "script-name",
+				}),
+				"utf-8"
+			);
+			await expect(
+				runWrangler("secret delete secret-name")
+			).rejects.toThrowErrorMatchingInlineSnapshot(
+				`
+				[Error: It looks like you've run a Workers-specific command in a Pages project.
+				For Pages, please run \`wrangler pages secret delete\` instead.]
+			`
+			);
+		});
 
 		it("should delete a secret", async () => {
 			mockDeleteRequest({ scriptName: "script-name", secretName: "the-key" });
@@ -344,9 +606,29 @@ describe("wrangler secret", () => {
 			});
 			await runWrangler("secret delete the-key --name script-name");
 			expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Deleting the secret the-key on the Worker script-name
-			✨ Success! Deleted secret the-key"
-		`);
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Deleting the secret the-key on the Worker script-name
+				✨ Success! Deleted secret the-key"
+			`);
+			expect(std.err).toMatchInlineSnapshot(`""`);
+		});
+
+		it("should delete a secret which name includes special characters", async () => {
+			mockDeleteRequest({ scriptName: "script-name", secretName: "the/key" });
+			mockConfirm({
+				text: "Are you sure you want to permanently delete the secret the/key on the Worker script-name?",
+				result: true,
+			});
+			await runWrangler("secret delete the/key --name script-name");
+			expect(std.out).toMatchInlineSnapshot(`
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Deleting the secret the/key on the Worker script-name
+				✨ Success! Deleted secret the/key"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
 		});
 
@@ -364,9 +646,12 @@ describe("wrangler secret", () => {
 				"secret delete the-key --name script-name --env some-env --legacy-env"
 			);
 			expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Deleting the secret the-key on the Worker script-name-some-env
-			✨ Success! Deleted secret the-key"
-		`);
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Deleting the secret the-key on the Worker script-name-some-env
+				✨ Success! Deleted secret the-key"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
 		});
 
@@ -383,9 +668,12 @@ describe("wrangler secret", () => {
 				"secret delete the-key --name script-name --env some-env --legacy-env false"
 			);
 			expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Deleting the secret the-key on the Worker script-name (some-env)
-			✨ Success! Deleted secret the-key"
-		`);
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Deleting the secret the-key on the Worker script-name (some-env)
+				✨ Success! Deleted secret the-key"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
 		});
 
@@ -397,15 +685,76 @@ describe("wrangler secret", () => {
 			} catch (e) {
 				error = e as Error;
 			}
-			expect(std.out).toMatchInlineSnapshot(`""`);
+			expect(std.out).toMatchInlineSnapshot(`
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`
-			"[31mX [41;31m[[41;97mERROR[41;31m][0m [1mRequired Worker name missing. Please specify the Worker name in wrangler.toml, or pass it as an argument with \`--name <worker-name>\`[0m
+				"[31mX [41;31m[[41;97mERROR[41;31m][0m [1mRequired Worker name missing. Please specify the Worker name in your Wrangler configuration file, or pass it as an argument with \`--name <worker-name>\`[0m
 
-			"
-		`);
+				"
+			`);
 			expect(error).toMatchInlineSnapshot(
-				`[Error: Required Worker name missing. Please specify the Worker name in wrangler.toml, or pass it as an argument with \`--name <worker-name>\`]`
+				`[Error: Required Worker name missing. Please specify the Worker name in your Wrangler configuration file, or pass it as an argument with \`--name <worker-name>\`]`
 			);
+		});
+
+		describe("multi-env warning", () => {
+			it("should warn if the wrangler config contains environments but none was specified in the command", async () => {
+				writeWranglerConfig({
+					env: {
+						test: {},
+					},
+				});
+				mockDeleteRequest({ scriptName: "script-name", secretName: "the-key" });
+				mockConfirm({
+					text: "Are you sure you want to permanently delete the secret the-key on the Worker script-name?",
+					result: true,
+				});
+				await runWrangler("secret delete the-key --name script-name");
+				expect(std.warn).toMatchInlineSnapshot(`
+					"[33m▲ [43;33m[[43;30mWARNING[43;33m][0m [1mMultiple environments are defined in the Wrangler configuration file, but no target environment was specified for the secret delete command.[0m
+
+					  To avoid unintentional changes to the wrong environment, it is recommended to explicitly specify
+					  the target environment using the \`-e|--env\` flag.
+					  If your intention is to use the top-level environment of your configuration simply pass an empty
+					  string to the flag to target such environment. For example \`--env=\\"\\"\`.
+
+					"
+				`);
+			});
+
+			it("should not warn if the wrangler config contains environments and one was specified in the command", async () => {
+				writeWranglerConfig({
+					env: {
+						test: {},
+					},
+				});
+				mockDeleteRequest(
+					{ scriptName: "script-name", secretName: "the-key" },
+					"test",
+					true
+				);
+				mockConfirm({
+					text: "Are you sure you want to permanently delete the secret the-key on the Worker script-name-test?",
+					result: true,
+				});
+				await runWrangler("secret delete the-key --name script-name -e test");
+				expect(std.warn).toMatchInlineSnapshot(`""`);
+			});
+
+			it("should not warn if the wrangler config doesn't contain environments and none was specified in the command", async () => {
+				writeWranglerConfig();
+				mockDeleteRequest({ scriptName: "script-name", secretName: "the-key" });
+				mockConfirm({
+					text: "Are you sure you want to permanently delete the secret the-key on the Worker script-name?",
+					result: true,
+				});
+				await runWrangler("secret delete the-key --name script-name");
+				expect(std.warn).toMatchInlineSnapshot(`""`);
+			});
 		});
 	});
 
@@ -421,43 +770,61 @@ describe("wrangler secret", () => {
 			const servicesOrScripts = env && !legacyEnv ? "services" : "scripts";
 			const environment = env && !legacyEnv ? "/environments/:envName" : "";
 			msw.use(
-				rest.get(
+				http.get(
 					`*/accounts/:accountId/workers/${servicesOrScripts}/:scriptName${environment}/secrets`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-						expect(req.params.scriptName).toEqual(
+					({ params }) => {
+						expect(params.accountId).toEqual("some-account-id");
+						expect(params.scriptName).toEqual(
 							legacyEnv && env ? `script-name-${env}` : "script-name"
 						);
 						if (!legacyEnv) {
-							expect(req.params.envName).toEqual(env);
+							expect(params.envName).toEqual(env);
 						}
 
-						return res.once(
-							ctx.json(
-								createFetchResult([
-									{
-										name: "the-secret-name",
-										type: "secret_text",
-									},
-								])
-							)
+						return HttpResponse.json(
+							createFetchResult([
+								{
+									name: "the-secret-name",
+									type: "secret_text",
+								},
+							])
 						);
-					}
+					},
+					{ once: true }
 				)
 			);
 		}
+
+		it("should error helpfully if pages_build_output_dir is set", async () => {
+			fs.writeFileSync(
+				"wrangler.toml",
+				TOML.stringify({
+					pages_build_output_dir: "public",
+					name: "script-name",
+				}),
+				"utf-8"
+			);
+			await expect(
+				runWrangler("secret list")
+			).rejects.toThrowErrorMatchingInlineSnapshot(
+				`
+				[Error: It looks like you've run a Workers-specific command in a Pages project.
+				For Pages, please run \`wrangler pages secret list\` instead.]
+			`
+			);
+		});
 
 		it("should list secrets", async () => {
 			mockListRequest({ scriptName: "script-name" });
 			await runWrangler("secret list --name script-name");
 			expect(std.out).toMatchInlineSnapshot(`
-			        "[
-			          {
-			            \\"name\\": \\"the-secret-name\\",
-			            \\"type\\": \\"secret_text\\"
-			          }
-			        ]"
-		      `);
+				"[
+				  {
+				    \\"name\\": \\"the-secret-name\\",
+				    \\"type\\": \\"secret_text\\"
+				  }
+				]"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
 		});
 
@@ -467,13 +834,13 @@ describe("wrangler secret", () => {
 				"secret list --name script-name --env some-env --legacy-env"
 			);
 			expect(std.out).toMatchInlineSnapshot(`
-			        "[
-			          {
-			            \\"name\\": \\"the-secret-name\\",
-			            \\"type\\": \\"secret_text\\"
-			          }
-			        ]"
-		      `);
+				"[
+				  {
+				    \\"name\\": \\"the-secret-name\\",
+				    \\"type\\": \\"secret_text\\"
+				  }
+				]"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
 		});
 
@@ -483,13 +850,13 @@ describe("wrangler secret", () => {
 				"secret list --name script-name --env some-env --legacy-env false"
 			);
 			expect(std.out).toMatchInlineSnapshot(`
-			        "[
-			          {
-			            \\"name\\": \\"the-secret-name\\",
-			            \\"type\\": \\"secret_text\\"
-			          }
-			        ]"
-		      `);
+				"[
+				  {
+				    \\"name\\": \\"the-secret-name\\",
+				    \\"type\\": \\"secret_text\\"
+				  }
+				]"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
 		});
 
@@ -502,34 +869,107 @@ describe("wrangler secret", () => {
 			}
 			expect(std.out).toMatchInlineSnapshot(`""`);
 			expect(std.err).toMatchInlineSnapshot(`
-			"[31mX [41;31m[[41;97mERROR[41;31m][0m [1mRequired Worker name missing. Please specify the Worker name in wrangler.toml, or pass it as an argument with \`--name <worker-name>\`[0m
+				"[31mX [41;31m[[41;97mERROR[41;31m][0m [1mRequired Worker name missing. Please specify the Worker name in your Wrangler configuration file, or pass it as an argument with \`--name <worker-name>\`[0m
 
-			"
-		`);
+				"
+			`);
 			expect(error).toMatchInlineSnapshot(
-				`[Error: Required Worker name missing. Please specify the Worker name in wrangler.toml, or pass it as an argument with \`--name <worker-name>\`]`
+				`[Error: Required Worker name missing. Please specify the Worker name in your Wrangler configuration file, or pass it as an argument with \`--name <worker-name>\`]`
 			);
+		});
+
+		describe("banner tests", () => {
+			it("banner if pretty", async () => {
+				mockListRequest({ scriptName: "script-name" });
+				await runWrangler("secret list --name script-name  --format=pretty");
+				expect(std.out).toMatchInlineSnapshot(`
+					"
+					 ⛅️ wrangler x.x.x
+					──────────────────
+					Secret Name: the-secret-name
+					"
+				`);
+			});
+			it("no banner if json", async () => {
+				mockListRequest({ scriptName: "script-name" });
+				await runWrangler("secret list --name script-name  --format=json");
+				expect(std.out).toMatchInlineSnapshot(`
+					"[
+					  {
+					    \\"name\\": \\"the-secret-name\\",
+					    \\"type\\": \\"secret_text\\"
+					  }
+					]"
+				`);
+			});
 		});
 	});
 
-	describe("secret:bulk", () => {
-		it("should fail secret:bulk w/ no pipe or JSON input", async () => {
-			jest
-				.spyOn(readline, "createInterface")
-				.mockImplementation(() => null as unknown as Interface);
-			await runWrangler(`secret:bulk --name script-name`);
-			expect(std.out).toMatchInlineSnapshot(
-				`"🌀 Creating the secrets for the Worker \\"script-name\\" "`
-			);
-			expect(std.err).toMatchInlineSnapshot(`
-			"[31mX [41;31m[[41;97mERROR[41;31m][0m [1m🚨 Please provide a JSON file or valid JSON pipe[0m
+	describe("bulk", () => {
+		const mockBulkRequest = (returnNetworkError = false) => {
+			msw.use(
+				http.get(
+					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
+					({ params }) => {
+						expect(params.accountId).toEqual("some-account-id");
 
-			"
-		`);
+						return HttpResponse.json(createFetchResult({ bindings: [] }));
+					}
+				),
+				http.patch(
+					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
+					({ params }) => {
+						expect(params.accountId).toEqual("some-account-id");
+						if (returnNetworkError) {
+							return HttpResponse.error();
+						}
+						return HttpResponse.json(createFetchResult(null));
+					}
+				)
+			);
+		};
+		it("should error helpfully if pages_build_output_dir is set", async () => {
+			fs.writeFileSync(
+				"wrangler.toml",
+				TOML.stringify({
+					pages_build_output_dir: "public",
+					name: "script-name",
+				}),
+				"utf-8"
+			);
+			await expect(
+				runWrangler("secret bulk")
+			).rejects.toThrowErrorMatchingInlineSnapshot(
+				`
+				[Error: It looks like you've run a Workers-specific command in a Pages project.
+				For Pages, please run \`wrangler pages secret bulk\` instead.]
+			`
+			);
 		});
 
-		it("should use secret:bulk w/ pipe input", async () => {
-			jest.spyOn(readline, "createInterface").mockImplementation(
+		it("should fail secret bulk w/ no pipe or JSON input", async () => {
+			vi.spyOn(readline, "createInterface").mockImplementation(
+				() => null as unknown as Interface
+			);
+			await runWrangler(`secret bulk --name script-name`);
+			expect(std.out).toMatchInlineSnapshot(
+				`
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\" "
+			`
+			);
+			expect(std.err).toMatchInlineSnapshot(`
+				"[31mX [41;31m[[41;97mERROR[41;31m][0m [1m🚨 No content found in file, or piped input.[0m
+
+				"
+			`);
+			expect(std.warn).toMatchInlineSnapshot(`""`);
+		});
+
+		it("should use secret bulk w/ pipe input", async () => {
+			vi.spyOn(readline, "createInterface").mockImplementation(
 				() =>
 					// `readline.Interface` is an async iterator: `[Symbol.asyncIterator](): AsyncIterableIterator<string>`
 					JSON.stringify({
@@ -537,41 +977,25 @@ describe("wrangler secret", () => {
 						password: "hunter2",
 					}) as unknown as Interface
 			);
+			mockBulkRequest();
 
-			msw.use(
-				rest.get(
-					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-
-						return res(ctx.json(createFetchResult({ bindings: [] })));
-					}
-				)
-			);
-			msw.use(
-				rest.patch(
-					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-
-						return res(ctx.json(createFetchResult(null)));
-					}
-				)
-			);
-
-			await runWrangler(`secret:bulk --name script-name`);
+			await runWrangler(`secret bulk --name script-name`);
 			expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secrets for the Worker \\"script-name\\"
-			✨ Successfully created secret for key: secret1
-			✨ Successfully created secret for key: password
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\"
+				✨ Successfully created secret for key: secret1
+				✨ Successfully created secret for key: password
 
-			Finished processing secrets JSON file:
-			✨ 2 secrets successfully uploaded"
-		`);
+				Finished processing secrets file:
+				✨ 2 secrets successfully uploaded"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
+			expect(std.warn).toMatchInlineSnapshot(`""`);
 		});
 
-		it("should create secret:bulk", async () => {
+		it("should create secrets from JSON file", async () => {
 			writeFileSync(
 				"secret.json",
 				JSON.stringify({
@@ -580,41 +1004,76 @@ describe("wrangler secret", () => {
 				})
 			);
 
-			msw.use(
-				rest.get(
-					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
+			mockBulkRequest();
 
-						return res(ctx.json(createFetchResult({ bindings: [] })));
-					}
-				)
-			);
-			msw.use(
-				rest.patch(
-					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-
-						return res(ctx.json(createFetchResult(null)));
-					}
-				)
-			);
-
-			await runWrangler("secret:bulk ./secret.json --name script-name");
+			await runWrangler("secret bulk ./secret.json --name script-name");
 
 			expect(std.out).toMatchInlineSnapshot(`
-					"🌀 Creating the secrets for the Worker \\"script-name\\"
-					✨ Successfully created secret for key: secret-name-1
-					✨ Successfully created secret for key: secret-name-2
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\"
+				✨ Successfully created secret for key: secret-name-1
+				✨ Successfully created secret for key: secret-name-2
 
-					Finished processing secrets JSON file:
-					✨ 2 secrets successfully uploaded"
+				Finished processing secrets file:
+				✨ 2 secrets successfully uploaded"
 			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
+			expect(std.warn).toMatchInlineSnapshot(`""`);
 		});
 
-		it("should count success and network failure on secret:bulk", async () => {
+		it("should create secrets from a env file", async () => {
+			writeFileSync(
+				".env",
+				`SECRET_NAME_1=secret_text\nSECRET_NAME_2=secret_text`
+			);
+
+			mockBulkRequest();
+
+			await runWrangler("secret bulk ./.env --name script-name");
+
+			expect(std.out).toMatchInlineSnapshot(`
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\"
+				✨ Successfully created secret for key: SECRET_NAME_1
+				✨ Successfully created secret for key: SECRET_NAME_2
+
+				Finished processing secrets file:
+				✨ 2 secrets successfully uploaded"
+			`);
+			expect(std.err).toMatchInlineSnapshot(`""`);
+			expect(std.warn).toMatchInlineSnapshot(`""`);
+		});
+
+		it("should fail if file is not valid JSON", async () => {
+			writeFileSync("secret.json", "bad file content");
+
+			await expect(
+				runWrangler("secret bulk ./secret.json --name script-name")
+			).rejects.toThrowError(
+				`The contents of "./secret.json" is not valid JSON`
+			);
+		});
+
+		it("should fail if JSON file contains a record with non-string values", async () => {
+			writeFileSync(
+				"secret.json",
+				JSON.stringify({
+					"invalid-secret": 999,
+				})
+			);
+
+			await expect(
+				runWrangler("secret bulk ./secret.json --name script-name")
+			).rejects.toThrowErrorMatchingInlineSnapshot(
+				`[Error: The value for "invalid-secret" in "./secret.json" is not a "string" instead it is of type "number"]`
+			);
+		});
+
+		it("should count success and network failure on secret bulk", async () => {
 			writeFileSync(
 				"secret.json",
 				JSON.stringify({
@@ -627,50 +1086,67 @@ describe("wrangler secret", () => {
 					"secret-name-7": "secret_text",
 				})
 			);
-
-			msw.use(
-				rest.get(
-					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-
-						return res(ctx.json(createFetchResult({ bindings: [] })));
-					}
-				)
-			);
-			msw.use(
-				rest.patch(
-					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-
-						return res.networkError(`Failed to create secret`);
-					}
-				)
-			);
+			mockBulkRequest(true);
 
 			await expect(async () => {
-				await runWrangler("secret:bulk ./secret.json --name script-name");
+				await runWrangler("secret bulk ./secret.json --name script-name");
 			}).rejects.toThrowErrorMatchingInlineSnapshot(
-				`"🚨 7 secrets failed to upload"`
+				`[TypeError: Failed to fetch]`
 			);
 
 			expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secrets for the Worker \\"script-name\\"
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\"
 
-			Finished processing secrets JSON file:
-			✨ 0 secrets successfully uploaded
+				🚨 Secrets failed to upload
 
-			[32mIf you think this is a bug then please create an issue at https://github.com/cloudflare/workers-sdk/issues/new/choose[0m"
-		`);
+				[32mIf you think this is a bug then please create an issue at https://github.com/cloudflare/workers-sdk/issues/new/choose[0m"
+			`);
 			expect(std.err).toMatchInlineSnapshot(`
-			"[31mX [41;31m[[41;97mERROR[41;31m][0m [1m🚨 7 secrets failed to upload[0m
+				"[31mX [41;31m[[41;97mERROR[41;31m][0m [1mFailed to fetch[0m
 
-			"
-		`);
+				"
+			`);
+			expect(std.warn).toMatchInlineSnapshot(`""`);
 		});
 
-		it("should handle network failure on secret:bulk", async () => {
+		it("should handle network failure on secret bulk", async () => {
+			writeFileSync(
+				"secret.json",
+				JSON.stringify({
+					"secret-name-1": "secret_text",
+					"secret-name-2": "secret_text",
+				})
+			);
+			mockBulkRequest(true);
+
+			await expect(async () => {
+				await runWrangler("secret bulk ./secret.json --name script-name");
+			}).rejects.toThrowErrorMatchingInlineSnapshot(
+				`[TypeError: Failed to fetch]`
+			);
+
+			expect(std.out).toMatchInlineSnapshot(`
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\"
+
+				🚨 Secrets failed to upload
+
+				[32mIf you think this is a bug then please create an issue at https://github.com/cloudflare/workers-sdk/issues/new/choose[0m"
+			`);
+			expect(std.err).toMatchInlineSnapshot(`
+				"[31mX [41;31m[[41;97mERROR[41;31m][0m [1mFailed to fetch[0m
+
+				"
+			`);
+			expect(std.warn).toMatchInlineSnapshot(`""`);
+		});
+
+		it("throws a meaningful error", async () => {
 			writeFileSync(
 				"secret.json",
 				JSON.stringify({
@@ -680,45 +1156,58 @@ describe("wrangler secret", () => {
 			);
 
 			msw.use(
-				rest.get(
+				http.get(
 					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
+					({ params }) => {
+						expect(params.accountId).toEqual("some-account-id");
 
-						return res(ctx.json(createFetchResult({ bindings: [] })));
+						return HttpResponse.json(createFetchResult({ bindings: [] }));
 					}
-				)
-			);
-			msw.use(
-				rest.patch(
+				),
+				http.patch(
 					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res) => {
-						expect(req.params.accountId).toEqual("some-account-id");
-
-						return res.networkError(`Failed to create secret`);
+					({ params }) => {
+						expect(params.accountId).toEqual("some-account-id");
+						return HttpResponse.json(
+							createFetchResult(null, false, [
+								{
+									message: "This is a helpful error",
+									code: 1,
+								},
+							])
+						);
 					}
 				)
 			);
 
 			await expect(async () => {
-				await runWrangler("secret:bulk ./secret.json --name script-name");
+				await runWrangler("secret bulk ./secret.json --name script-name");
 			}).rejects.toThrowErrorMatchingInlineSnapshot(
-				`"🚨 2 secrets failed to upload"`
+				`[APIError: A request to the Cloudflare API (/accounts/some-account-id/workers/scripts/script-name/settings) failed.]`
 			);
 
-			expect(std.out).toMatchInlineSnapshot(`
-			"🌀 Creating the secrets for the Worker \\"script-name\\"
+			expect(std).toMatchInlineSnapshot(`
+				Object {
+				  "debug": "",
+				  "err": "[31mX [41;31m[[41;97mERROR[41;31m][0m [1mA request to the Cloudflare API (/accounts/some-account-id/workers/scripts/script-name/settings) failed.[0m
 
-			Finished processing secrets JSON file:
-			✨ 0 secrets successfully uploaded
+				  This is a helpful error [code: 1]
 
-			[32mIf you think this is a bug then please create an issue at https://github.com/cloudflare/workers-sdk/issues/new/choose[0m"
-		`);
-			expect(std.err).toMatchInlineSnapshot(`
-			"[31mX [41;31m[[41;97mERROR[41;31m][0m [1m🚨 2 secrets failed to upload[0m
+				  If you think this is a bug, please open an issue at:
+				  [4mhttps://github.com/cloudflare/workers-sdk/issues/new/choose[0m
 
-			"
-		`);
+				",
+				  "info": "",
+				  "out": "
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\"
+
+				🚨 Secrets failed to upload
+				",
+				  "warn": "",
+				}
+			`);
 		});
 
 		it("should merge existing bindings and secrets when patching", async () => {
@@ -732,44 +1221,40 @@ describe("wrangler secret", () => {
 			);
 
 			msw.use(
-				rest.get(
+				http.get(
 					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					(req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
+					({ params }) => {
+						expect(params.accountId).toEqual("some-account-id");
 
-						return res(
-							ctx.json(
-								createFetchResult({
-									bindings: [
-										{
-											type: "plain_text",
-											name: "env_var",
-											text: "the content",
-										},
-										{
-											type: "json",
-											name: "another_var",
-											json: { some: "stuff" },
-										},
-										{ type: "secret_text", name: "secret-name-1" },
-										{ type: "secret_text", name: "secret-name-2" },
-										{ type: "secret_text", name: "secret-name-4" },
-									],
-								})
-							)
+						return HttpResponse.json(
+							createFetchResult({
+								bindings: [
+									{
+										type: "plain_text",
+										name: "env_var",
+										text: "the content",
+									},
+									{
+										type: "json",
+										name: "another_var",
+										json: { some: "stuff" },
+									},
+									{ type: "secret_text", name: "secret-name-1" },
+									{ type: "secret_text", name: "secret-name-2" },
+									{ type: "secret_text", name: "secret-name-4" },
+								],
+							})
 						);
 					}
 				)
 			);
 			msw.use(
-				rest.patch(
+				http.patch(
 					`*/accounts/:accountId/workers/scripts/:scriptName/settings`,
-					async (req, res, ctx) => {
-						expect(req.params.accountId).toEqual("some-account-id");
+					async ({ request, params }) => {
+						expect(params.accountId).toEqual("some-account-id");
 
-						const formBody = await (
-							req as MockedRequest as RestRequestWithFormData
-						).formData();
+						const formBody = await request.formData();
 						const settings = formBody.get("settings");
 						expect(settings).not.toBeNull();
 						const parsedSettings = JSON.parse(settings as string);
@@ -794,58 +1279,145 @@ describe("wrangler secret", () => {
 						expect(parsedSettings).not.toHaveProperty(["bindings", 0, "text"]);
 						expect(parsedSettings).not.toHaveProperty(["bindings", 1, "json"]);
 
-						return res(ctx.json(createFetchResult(null)));
+						return HttpResponse.json(createFetchResult(null));
 					}
 				)
 			);
 
-			await runWrangler("secret:bulk ./secret.json --name script-name");
+			await runWrangler("secret bulk ./secret.json --name script-name");
 
 			expect(std.out).toMatchInlineSnapshot(`
-					"🌀 Creating the secrets for the Worker \\"script-name\\"
-					✨ Successfully created secret for key: secret-name-2
-					✨ Successfully created secret for key: secret-name-3
-					✨ Successfully created secret for key: secret-name-4
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\"
+				✨ Successfully created secret for key: secret-name-2
+				✨ Successfully created secret for key: secret-name-3
+				✨ Successfully created secret for key: secret-name-4
 
-					Finished processing secrets JSON file:
-					✨ 3 secrets successfully uploaded"
+				Finished processing secrets file:
+				✨ 3 secrets successfully uploaded"
 			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
+			expect(std.warn).toMatchInlineSnapshot(`""`);
+		});
+
+		it("should, in interactive mode, ask to create a new Worker if no Worker is found under the provided name", async () => {
+			setIsTTY(true);
+			writeFileSync(
+				"secret.json",
+				JSON.stringify({
+					"secret-name-1": "secret_text",
+					"secret-name-2": "secret_text",
+				})
+			);
+			mockNoWorkerFound(true);
+			mockConfirm({
+				text: `There doesn't seem to be a Worker called "non-existent-worker". Do you want to create a new Worker with that name and add secrets to it?`,
+				result: false,
+			});
+
+			await runWrangler("secret bulk ./secret.json --name non-existent-worker");
+			expect(std.out).toMatchInlineSnapshot(`
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"non-existent-worker\\"
+				Aborting. No secrets added."
+			`);
+		});
+
+		it("should, in non-interactive mode, create a new worker if no worker is found under the provided name", async () => {
+			setIsTTY(false);
+			writeFileSync(
+				"secret.json",
+				JSON.stringify({
+					"secret-name-1": "secret_text",
+					"secret-name-2": "secret_text",
+				})
+			);
+			mockNoWorkerFound();
+			msw.use(
+				http.put(
+					"*/accounts/:accountId/workers/scripts/:name",
+					async ({ params }) => {
+						expect(params.name).toEqual("non-existent-worker");
+						return HttpResponse.json(createFetchResult({ name: params.name }));
+					}
+				)
+			);
+			mockBulkRequest();
+
+			await runWrangler("secret bulk ./secret.json --name script-name");
+			expect(std.out).toMatchInlineSnapshot(`
+				"
+				 ⛅️ wrangler x.x.x
+				──────────────────
+				🌀 Creating the secrets for the Worker \\"script-name\\"
+				✨ Successfully created secret for key: secret-name-1
+				✨ Successfully created secret for key: secret-name-2
+
+				Finished processing secrets file:
+				✨ 2 secrets successfully uploaded"
+			`);
+		});
+
+		describe("multi-env warning", () => {
+			it("should warn if the wrangler config contains environments but none was specified in the command", async () => {
+				writeWranglerConfig({
+					name: "test-name",
+					main: "./index.js",
+					env: {
+						test: {},
+					},
+				});
+				writeFileSync("secret.json", JSON.stringify({}));
+
+				mockBulkRequest();
+
+				await runWrangler("secret bulk ./secret.json --name script-name");
+				expect(std.warn).toMatchInlineSnapshot(`
+					"[33m▲ [43;33m[[43;30mWARNING[43;33m][0m [1mMultiple environments are defined in the Wrangler configuration file, but no target environment was specified for the secret bulk command.[0m
+
+					  To avoid unintentional changes to the wrong environment, it is recommended to explicitly specify
+					  the target environment using the \`-e|--env\` flag.
+					  If your intention is to use the top-level environment of your configuration simply pass an empty
+					  string to the flag to target such environment. For example \`--env=\\"\\"\`.
+
+					"
+				`);
+			});
+
+			it("should not warn if the wrangler config contains environments and one was specified in the command", async () => {
+				writeWranglerConfig({
+					name: "test-name",
+					main: "./index.js",
+					env: {
+						test: {},
+					},
+				});
+				writeFileSync("secret.json", JSON.stringify({}));
+
+				mockBulkRequest();
+
+				await runWrangler(
+					"secret bulk ./secret.json --name script-name -e test"
+				);
+				expect(std.warn).toMatchInlineSnapshot(`""`);
+			});
+
+			it("should not warn if the wrangler config doesn't contain environments and none was specified in the command", async () => {
+				writeWranglerConfig({
+					name: "test-name",
+					main: "./index.js",
+				});
+				writeFileSync("secret.json", JSON.stringify({}));
+
+				mockBulkRequest();
+
+				await runWrangler("secret bulk ./secret.json --name script-name");
+				expect(std.warn).toMatchInlineSnapshot(`""`);
+			});
 		});
 	});
 });
-
-FormData.prototype.toString = mockFormDataToString;
-export interface RestRequestWithFormData extends MockedRequest, RestRequest {
-	formData(): Promise<FormData>;
-}
-(MockedRequest.prototype as RestRequestWithFormData).formData =
-	mockFormDataFromString;
-
-function mockFormDataToString(this: FormData) {
-	const entries = [];
-	for (const [key, value] of this.entries()) {
-		if (value instanceof Blob) {
-			const reader = new FileReaderSync();
-			reader.readAsText(value);
-			const result = reader.result;
-			entries.push([key, result]);
-		} else {
-			entries.push([key, value]);
-		}
-	}
-	return JSON.stringify({
-		__formdata: entries,
-	});
-}
-
-async function mockFormDataFromString(this: MockedRequest): Promise<FormData> {
-	const { __formdata } = await this.json();
-	expect(__formdata).toBeInstanceOf(Array);
-
-	const form = new FormData();
-	for (const [key, value] of __formdata) {
-		form.set(key, value);
-	}
-	return form;
-}

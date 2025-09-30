@@ -1,11 +1,11 @@
-import { eg, TypeFromCodec } from "@cloudflare/util-en-garde";
-import { useDebounce } from "@cloudflare/util-hooks";
+import { eg } from "@cloudflare/util-en-garde";
 import lzstring from "lz-string";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import useSWR from "swr";
 import { v4 } from "uuid";
 import { getPlaygroundWorker } from "./getPlaygroundWorker";
 import { matchFiles, parseRules, toMimeType } from "./module-collection";
+import type { TypeFromCodec } from "@cloudflare/util-en-garde";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -20,7 +20,7 @@ export const DeployPlaygroundWorkerResponse = eg.union([
 	}),
 ]);
 
-const PreviewAPIErrorCodec = eg.array(
+export const PreviewAPIErrorCodec = eg.array(
 	eg.object({
 		message: eg.string,
 		code: eg.number,
@@ -75,15 +75,15 @@ export function serialiseWorker(service: PartialWorker): FormData {
 	const entrypointModule = typedModules.find(
 		(m) => m.name === service.entrypoint
 	);
-	// Try to find a requirements.txt file
+	// Try to find a cf-requirements.txt file
 	const isPythonEntrypoint = entrypointModule?.type === "python";
 
 	if (isPythonEntrypoint) {
 		try {
-			const pythonRequirements = service.modules["requirements.txt"];
+			const pythonRequirements = service.modules["cf-requirements.txt"];
 			if (pythonRequirements) {
 				const textContent = decoder.decode(pythonRequirements.contents);
-				// This is incredibly naive. However, it supports common syntax for requirements.txt
+				// This is incredibly naive. However, it supports common syntax for cf-requirements.txt
 				for (const requirement of textContent.split("\n")) {
 					const packageName = requirement.match(/^[^\d\W]\w*/);
 					if (typeof packageName?.[0] === "string") {
@@ -98,10 +98,10 @@ export function serialiseWorker(service: PartialWorker): FormData {
 					}
 				}
 			}
-			// We don't care if a requirements.txt isn't found
-		} catch (e) {
+			// We don't care if a cf-requirements.txt isn't found
+		} catch {
 			console.debug(
-				"Python entrypoint detected, but no requirements.txt file found."
+				"Python entrypoint detected, but no cf-requirements.txt file found."
 			);
 		}
 	}
@@ -129,23 +129,21 @@ export type PreviewHash = {
 	serialised: string;
 };
 
-async function compressWorker(worker: FormData) {
+export async function compressTextWorker(contentType: string, worker: string) {
+	return lzstring.compressToEncodedURIComponent(`${contentType}:${worker}`);
+}
+
+export async function compressWorker(worker: FormData) {
 	const serialisedWorker = new Response(worker);
-	return lzstring.compressToEncodedURIComponent(
-		`${serialisedWorker.headers.get(
-			"content-type"
-		)}:${await serialisedWorker.text()}`
+	return compressTextWorker(
+		serialisedWorker.headers.get("content-type") ?? "",
+		await serialisedWorker.text()
 	);
 }
 
-async function updatePreviewHash(
-	content: Worker,
-	updateWorkerHash: (hash: string) => void
-): Promise<PreviewHash> {
+async function updatePreviewHash(content: Worker): Promise<PreviewHash> {
 	const worker = serialiseWorker(content);
 	const serialised = await compressWorker(worker);
-	const playgroundUrl = `/playground#${serialised}`;
-	updateWorkerHash(playgroundUrl);
 
 	const res = await fetch("/playground/api/worker", {
 		method: "POST",
@@ -169,16 +167,13 @@ async function updatePreviewHash(
 	};
 }
 
-const DEBOUNCE_TIMEOUT = 1000;
-
-export function useDraftWorker(
-	initialHash: string,
-	updateWorkerHash: (hash: string) => void
-): {
+export function useDraftWorker(initialHash: string): {
 	isLoading: boolean;
 	service: Worker | null;
+	previewService: Worker | null;
 	devtoolsUrl: string | undefined;
-	preview: (content: Pick<Worker, "entrypoint" | "modules">) => void;
+	updateDraft: (content: Pick<Worker, "entrypoint" | "modules">) => void;
+	preview: () => void;
 	previewHash: PreviewHash | undefined;
 	previewError: string | undefined;
 	parseError: string | undefined;
@@ -190,60 +185,54 @@ export function useDraftWorker(
 		data: worker,
 		isLoading,
 		error,
-	} = useSWR(initialHash, getPlaygroundWorker);
+	} = useSWR(initialHash, getPlaygroundWorker, {
+		// There is no need to revalidate playground worker as it is rarely updated
+		revalidateOnFocus: false,
+	});
 
 	const [draftWorker, setDraftWorker] =
 		useState<Pick<Worker, "entrypoint" | "modules">>();
-
+	const [previewWorker, setPreviewWorker] = useState(draftWorker);
 	const [previewHash, setPreviewHash] = useState<PreviewHash>();
 	const [previewError, setPreviewError] = useState<string>();
 	const [devtoolsUrl, setDevtoolsUrl] = useState<string>();
 
-	const updatePreview = useDebounce(
-		async (wk?: Pick<Worker, "entrypoint" | "modules">) => {
-			setDraftWorker(wk);
-			if (worker === undefined) {
-				return;
-			}
+	useEffect(() => {
+		async function updatePreview(content: Worker) {
 			try {
 				setIsPreviewUpdating(true);
-				const hash = await updatePreviewHash(
-					{
-						...worker,
-						...(wk ?? draftWorker),
-					},
-					updateWorkerHash
-				);
+				const hash = await updatePreviewHash(content);
 				setPreviewHash(hash);
 				setDevtoolsUrl(hash.devtoolsUrl);
 			} catch (e: unknown) {
 				console.error(e);
-				if (e instanceof Error) setPreviewError(String(e.message));
+				if (e instanceof Error) {
+					setPreviewError(String(e.message));
+				}
 			} finally {
 				setIsPreviewUpdating(false);
 			}
-		},
-		DEBOUNCE_TIMEOUT
-	);
-
-	const initialPreview = useRef(false);
-	useEffect(() => {
-		if (worker && !initialPreview.current) {
-			initialPreview.current = true;
-			setIsPreviewUpdating(true);
-			void updatePreview(worker).then(() => setIsPreviewUpdating(false));
 		}
-	}, [worker]);
+
+		if (worker) {
+			void updatePreview({
+				...worker,
+				...previewWorker,
+			});
+		}
+	}, [worker, previewWorker]);
 
 	return {
 		isLoading,
 		service: worker ? { ...worker, ...draftWorker } : null,
-		preview: (...args) => {
-			// updatePreview is debounced, so call setPreviewHash outside of it
-			setPreviewHash(undefined);
-			setPreviewError(undefined);
-			void updatePreview(...args);
+		previewService: worker ? { ...worker, ...previewWorker } : null,
+		preview: () => {
+			if (previewWorker !== draftWorker) {
+				setPreviewHash(undefined);
+				setPreviewWorker(draftWorker);
+			}
 		},
+		updateDraft: setDraftWorker,
 		devtoolsUrl,
 		previewHash,
 		isPreviewUpdating,

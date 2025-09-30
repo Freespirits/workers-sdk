@@ -1,16 +1,22 @@
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
-import { isDarkMode, variables as theme } from "@cloudflare/style-const";
+import { isDarkMode, variables } from "@cloudflare/style-const";
 import { createComponent } from "@cloudflare/style-container";
+import {
+	BORDER_GRAY,
+	STYLED_TAB_HEIGHT,
+} from "@cloudflare/workers-editor-shared";
 import {
 	Tab as ReactTab,
 	TabList as ReactTabList,
 	TabPanel as ReactTabPanel,
-	TabProps as ReactTabProps,
 	Tabs as ReactTabs,
 } from "react-tabs";
-import { BORDER_GRAY, STYLED_TAB_HEIGHT } from "./constants";
+import type {
+	TabPanelProps as ReactTabPanelProps,
+	TabProps as ReactTabProps,
+} from "react-tabs";
 
-const HIGHLIGHT_BLUE = theme.colors.blue[4];
+const HIGHLIGHT_BLUE = variables.colors.blue[4];
 
 type StyledTabProps = {
 	showHighlightBar?: boolean;
@@ -42,8 +48,8 @@ export const Tab = createComponent<typeof ReactTab, StyledTabProps>(
 				? theme.colors.gray[8]
 				: theme.colors.white
 			: isDarkMode()
-			? theme.colors.white
-			: theme.colors.gray[9],
+				? theme.colors.white
+				: theme.colors.gray[9],
 		outlineOffset: -3,
 		borderRadius: 0,
 		":first-child": {
@@ -99,7 +105,9 @@ export const TabBar = createComponent(() => ({
 	display: "flex",
 	alignItems: "center",
 	justifyContent: "space-between",
-	backgroundColor: isDarkMode() ? theme.colors.white : theme.colors.gray[9],
+	backgroundColor: isDarkMode()
+		? variables.colors.white
+		: variables.colors.gray[9],
 	flex: "none",
 }));
 
@@ -117,7 +125,9 @@ export const TabList = createComponent(
 export const TabBarContent = createComponent(() => ({
 	flex: "1 0 auto",
 	borderBottom: "none",
-	backgroundColor: isDarkMode() ? theme.colors.white : theme.colors.gray[9],
+	backgroundColor: isDarkMode()
+		? variables.colors.white
+		: variables.colors.gray[9],
 }));
 
 export const Tabs = createComponent(
@@ -130,12 +140,14 @@ export const Tabs = createComponent(
 	ReactTabs
 );
 
-export const TabPanel = createComponent(
-	({ selected }) => ({
+export const TabPanel = createComponent<
+	React.FC<ReactTabPanelProps & { scrollable?: boolean }>
+>(
+	({ selected, scrollable }) => ({
 		display: selected ? "flex" : "none",
 		flex: selected ? "auto" : "none",
 		position: "relative",
-		overflow: "hidden",
+		overflow: scrollable ? "auto" : "hidden",
 	}),
 	ReactTabPanel
 );

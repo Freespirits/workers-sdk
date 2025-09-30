@@ -1,24 +1,24 @@
+import { strict as assert } from "node:assert";
 import { Blob } from "node:buffer";
 import { arrayBuffer } from "node:stream/consumers";
 import { StringDecoder } from "node:string_decoder";
-import { readConfig } from "../config";
+import { readConfig, updateConfigFile } from "../config";
+import { demandOneOfOption } from "../core";
+import { createCommand, createNamespace } from "../core/create-command";
 import { confirm } from "../dialogs";
-import { UserError } from "../errors";
-import {
-	CommandLineArgsError,
-	demandOneOfOption,
-	printWranglerBanner,
-} from "../index";
+import { CommandLineArgsError, UserError } from "../errors";
 import { logger } from "../logger";
 import * as metrics from "../metrics";
 import { parseJSON, readFileSync, readFileSyncToBuffer } from "../parse";
 import { requireAuth } from "../user";
 import { getValidBindingName } from "../utils/getValidBindingName";
+import { isLocal, printResourceLocation } from "../utils/is-local";
 import {
-	createKVNamespace,
+	BATCH_MAX_ERRORS_WARNINGS,
 	deleteKVBulkKeyValue,
 	deleteKVKeyValue,
 	deleteKVNamespace,
+	getKVBulkKeyValue,
 	getKVKeyValue,
 	getKVNamespaceId,
 	isKVKeyValue,
@@ -27,726 +27,1096 @@ import {
 	putKVBulkKeyValue,
 	putKVKeyValue,
 	unexpectedKVKeyValueProps,
+	updateKVNamespace,
 	usingLocalNamespace,
 } from "./helpers";
 import type { EventNames } from "../metrics";
-import type { CommonYargsArgv } from "../yargs-types";
 import type { KeyValue, NamespaceKeyInfo } from "./helpers";
 
-export function kvNamespace(kvYargs: CommonYargsArgv) {
-	return kvYargs
-		.command(
-			"create <namespace>",
-			"Create a new namespace",
-			(yargs) => {
-				return yargs
-					.positional("namespace", {
-						describe: "The name of the new namespace",
-						type: "string",
-						demandOption: true,
-					})
-					.option("preview", {
-						type: "boolean",
-						describe: "Interact with a preview namespace",
-					});
-			},
-			async (args) => {
-				await printWranglerBanner();
+export const kvNamespace = createNamespace({
+	metadata: {
+		description: "🗂️  Manage Workers KV Namespaces",
+		status: "stable",
+		owner: "Product: KV",
+	},
+});
 
-				const config = readConfig(args.config, args);
-				if (!config.name) {
-					logger.warn(
-						"No configured name present, using `worker` as a prefix for the title"
-					);
-				}
+export const kvNamespaceNamespace = createNamespace({
+	metadata: {
+		description: `Interact with your Workers KV Namespaces`,
+		status: "stable",
+		owner: "Product: KV",
+	},
+});
 
-				const name = config.name || "worker";
-				const environment = args.env ? `-${args.env}` : "";
-				const preview = args.preview ? "_preview" : "";
-				const title = `${name}${environment}-${args.namespace}${preview}`;
+export const kvKeyNamespace = createNamespace({
+	metadata: {
+		description: `Individually manage Workers KV key-value pairs`,
+		status: "stable",
+		owner: "Product: KV",
+	},
+});
 
-				const accountId = await requireAuth(config);
+export const kvBulkNamespace = createNamespace({
+	metadata: {
+		description: `Interact with multiple Workers KV key-value pairs at once`,
+		status: "stable",
+		owner: "Product: KV",
+	},
+});
 
-				// TODO: generate a binding name stripping non alphanumeric chars
+export const kvNamespaceCreateCommand = createCommand({
+	metadata: {
+		description: "Create a new namespace",
+		status: "stable",
+		owner: "Product: KV",
+	},
 
-				logger.log(`🌀 Creating namespace with title "${title}"`);
-				const namespaceId = await createKVNamespace(accountId, title);
-				await metrics.sendMetricsEvent("create kv namespace", {
-					sendMetrics: config.send_metrics,
-				});
+	args: {
+		namespace: {
+			describe: "The name of the new namespace",
+			type: "string",
+			demandOption: true,
+		},
+		preview: {
+			type: "boolean",
+			describe: "Interact with a preview namespace",
+		},
+	},
+	positionalArgs: ["namespace"],
 
-				logger.log("✨ Success!");
-				const envString = args.env ? ` under [env.${args.env}]` : "";
-				const previewString = args.preview ? "preview_" : "";
-				logger.log(
-					`Add the following to your configuration file in your kv_namespaces array${envString}:`
+	async handler(args, { sdk }) {
+		const config = readConfig(args);
+		const environment = args.env ? `${args.env}-` : "";
+		const preview = args.preview ? "_preview" : "";
+		const title = `${environment}${args.namespace}${preview}`;
+
+		const accountId = await requireAuth(config);
+		printResourceLocation("remote");
+		// TODO: generate a binding name stripping non alphanumeric chars
+		logger.log(`🌀 Creating namespace with title "${title}"`);
+
+		const { id: namespaceId } = await sdk.kv.namespaces.create({
+			account_id: accountId,
+			title,
+		});
+		metrics.sendMetricsEvent("create kv namespace", {
+			sendMetrics: config.send_metrics,
+		});
+
+		logger.log("✨ Success!");
+		const previewString = args.preview ? "preview_" : "";
+
+		await updateConfigFile(
+			(name) => ({
+				kv_namespaces: [
+					{
+						binding: getValidBindingName(name ?? args.namespace, "KV"),
+						[`${previewString}id`]: namespaceId,
+					},
+				],
+			}),
+			config.configPath,
+			args.env,
+			!args.preview
+		);
+	},
+});
+
+export const kvNamespaceListCommand = createCommand({
+	metadata: {
+		description:
+			"Output a list of all KV namespaces associated with your account id",
+		status: "stable",
+		owner: "Product: KV",
+	},
+
+	args: {},
+
+	behaviour: { printBanner: false, printResourceLocation: false },
+	async handler(_, { config, sdk }) {
+		const accountId = await requireAuth(config);
+
+		const allNamespaces = [];
+
+		for await (const namespace of sdk.kv.namespaces.list({
+			account_id: accountId,
+			per_page: 1000,
+			order: "title",
+			direction: "asc",
+		})) {
+			allNamespaces.push(namespace);
+		}
+
+		logger.log(JSON.stringify(allNamespaces, null, "  "));
+		metrics.sendMetricsEvent("list kv namespaces", {
+			sendMetrics: config.send_metrics,
+		});
+	},
+});
+
+export const kvNamespaceDeleteCommand = createCommand({
+	metadata: {
+		description: "Delete a given namespace.",
+		status: "stable",
+		owner: "Product: KV",
+	},
+	args: {
+		binding: {
+			type: "string",
+			requiresArg: true,
+			describe: "The binding name to the namespace to delete from",
+		},
+		"namespace-id": {
+			type: "string",
+			requiresArg: true,
+			describe: "The id of the namespace to delete",
+		},
+		preview: {
+			type: "boolean",
+			describe: "Interact with a preview namespace",
+		},
+	},
+
+	validateArgs(args) {
+		demandOneOfOption("binding", "namespace-id")(args);
+	},
+
+	async handler(args) {
+		const config = readConfig(args);
+		printResourceLocation("remote");
+		let id;
+		try {
+			id = getKVNamespaceId(args, config);
+		} catch (e) {
+			throw new CommandLineArgsError(
+				"Not able to delete namespace.\n" + ((e as Error).message ?? e)
+			);
+		}
+
+		const accountId = await requireAuth(config);
+
+		logger.log(`Deleting KV namespace ${id}.`);
+		await deleteKVNamespace(config, accountId, id);
+		logger.log(`Deleted KV namespace ${id}.`);
+		metrics.sendMetricsEvent("delete kv namespace", {
+			sendMetrics: config.send_metrics,
+		});
+
+		// TODO: recommend they remove it from wrangler.toml
+
+		// test-mf wrangler kv:namespace delete --namespace-id 2a7d3d8b23fc4159b5afa489d6cfd388
+		// Are you sure you want to delete namespace 2a7d3d8b23fc4159b5afa489d6cfd388? [y/n]
+		// n
+		// 💁  Not deleting namespace 2a7d3d8b23fc4159b5afa489d6cfd388
+		// ➜  test-mf wrangler kv:namespace delete --namespace-id 2a7d3d8b23fc4159b5afa489d6cfd388
+		// Are you sure you want to delete namespace 2a7d3d8b23fc4159b5afa489d6cfd388? [y/n]
+		// y
+		// 🌀  Deleting namespace 2a7d3d8b23fc4159b5afa489d6cfd388
+		// ✨  Success
+		// ⚠️  Make sure to remove this "kv-namespace" entry from your configuration file!
+		// ➜  test-mf
+
+		// TODO: do it automatically
+
+		// TODO: delete the preview namespace as well?
+	},
+});
+
+export const kvNamespaceRenameCommand = createCommand({
+	metadata: {
+		description: "Rename a KV namespace",
+		status: "stable",
+		owner: "Product: KV",
+	},
+	positionalArgs: ["old-name"],
+	args: {
+		"old-name": {
+			type: "string",
+			describe: "The current name (title) of the namespace to rename",
+		},
+		"namespace-id": {
+			type: "string",
+			describe: "The id of the namespace to rename",
+		},
+		"new-name": {
+			type: "string",
+			describe: "The new name for the namespace",
+			demandOption: true,
+		},
+	},
+
+	validateArgs(args) {
+		// Check if both name and namespace-id are provided
+		if (args.oldName && args.namespaceId) {
+			throw new CommandLineArgsError(
+				"Cannot specify both old-name and --namespace-id. Use either old-name (as first argument) or --namespace-id flag, not both."
+			);
+		}
+
+		// Require either old-name or namespace-id
+		if (!args.namespaceId && !args.oldName) {
+			throw new CommandLineArgsError(
+				"Either old-name (as first argument) or --namespace-id must be specified"
+			);
+		}
+
+		// Validate new-name length (API limit is 512 characters)
+		if (args.newName && args.newName.length > 512) {
+			throw new CommandLineArgsError(
+				`new-name must be 512 characters or less (current: ${args.newName.length})`
+			);
+		}
+	},
+
+	async handler(args) {
+		const config = readConfig(args);
+		printResourceLocation("remote");
+		const accountId = await requireAuth(config);
+
+		let namespaceId = args.namespaceId;
+
+		// If no namespace ID provided, find it by current name
+		if (!namespaceId && args.oldName) {
+			const namespaces = await listKVNamespaces(config, accountId);
+			const namespace = namespaces.find((ns) => ns.title === args.oldName);
+
+			if (!namespace) {
+				throw new UserError(
+					`No namespace found with the name "${args.oldName}". ` +
+						`Use --namespace-id instead or check available namespaces with "wrangler kv namespace list".`
 				);
-				logger.log(
-					`{ binding = "${getValidBindingName(
-						args.namespace,
-						"KV"
-					)}", ${previewString}id = "${namespaceId}" }`
-				);
-
-				// TODO: automatically write this block to the wrangler.toml config file??
 			}
-		)
-		.command(
-			"list",
-			"Outputs a list of all KV namespaces associated with your account id.",
-			(listArgs) => listArgs,
-			async (args) => {
-				const config = readConfig(args.config, args);
+			namespaceId = namespace.id;
+		}
 
-				const accountId = await requireAuth(config);
+		assert(namespaceId, "namespaceId should be defined");
+		logger.log(`Renaming KV namespace ${namespaceId} to "${args.newName}".`);
+		const updatedNamespace = await updateKVNamespace(
+			config,
+			accountId,
+			namespaceId,
+			args.newName
+		);
+		logger.log(
+			`✨ Successfully renamed namespace to "${updatedNamespace.title}"`
+		);
+	},
+});
 
-				// TODO: we should show bindings if they exist for given ids
-
-				logger.log(
-					JSON.stringify(await listKVNamespaces(accountId), null, "  ")
-				);
-				await metrics.sendMetricsEvent("list kv namespaces", {
-					sendMetrics: config.send_metrics,
-				});
-			}
-		)
-		.command(
-			"delete",
-			"Deletes a given namespace.",
-			(yargs) => {
-				return yargs
-					.option("binding", {
-						type: "string",
-						requiresArg: true,
-						describe: "The name of the namespace to delete",
-					})
-					.option("namespace-id", {
-						type: "string",
-						requiresArg: true,
-						describe: "The id of the namespace to delete",
-					})
-					.check(demandOneOfOption("binding", "namespace-id"))
-					.option("preview", {
-						type: "boolean",
-						describe: "Interact with a preview namespace",
-					});
-			},
-			async (args) => {
-				await printWranglerBanner();
-				const config = readConfig(args.config, args);
-
-				let id;
+export const kvKeyPutCommand = createCommand({
+	metadata: {
+		description: "Write a single key/value pair to the given namespace",
+		status: "stable",
+		owner: "Product: KV",
+	},
+	behaviour: {
+		printResourceLocation: true,
+	},
+	positionalArgs: ["key", "value"],
+	args: {
+		key: {
+			type: "string",
+			describe: "The key to write to",
+			demandOption: true,
+		},
+		value: {
+			type: "string",
+			describe: "The value to write",
+		},
+		binding: {
+			type: "string",
+			requiresArg: true,
+			describe: "The binding name to the namespace to write to",
+		},
+		"namespace-id": {
+			type: "string",
+			requiresArg: true,
+			describe: "The id of the namespace to write to",
+		},
+		preview: {
+			type: "boolean",
+			describe: "Interact with a preview namespace",
+		},
+		ttl: {
+			type: "number",
+			describe: "Time for which the entries should be visible",
+		},
+		expiration: {
+			type: "number",
+			describe: "Time since the UNIX epoch after which the entry expires",
+		},
+		metadata: {
+			type: "string",
+			describe: "Arbitrary JSON that is associated with a key",
+			coerce: (jsonStr: string): KeyValue["metadata"] => {
 				try {
-					id = getKVNamespaceId(args, config);
-				} catch (e) {
-					throw new CommandLineArgsError(
-						"Not able to delete namespace.\n" + ((e as Error).message ?? e)
-					);
-				}
-
-				const accountId = await requireAuth(config);
-
-				logger.log(`Deleting KV namespace ${id}.`);
-				await deleteKVNamespace(accountId, id);
-				logger.log(`Deleted KV namespace ${id}.`);
-				await metrics.sendMetricsEvent("delete kv namespace", {
-					sendMetrics: config.send_metrics,
-				});
-
-				// TODO: recommend they remove it from wrangler.toml
-
-				// test-mf wrangler kv:namespace delete --namespace-id 2a7d3d8b23fc4159b5afa489d6cfd388
-				// Are you sure you want to delete namespace 2a7d3d8b23fc4159b5afa489d6cfd388? [y/n]
-				// n
-				// 💁  Not deleting namespace 2a7d3d8b23fc4159b5afa489d6cfd388
-				// ➜  test-mf wrangler kv:namespace delete --namespace-id 2a7d3d8b23fc4159b5afa489d6cfd388
-				// Are you sure you want to delete namespace 2a7d3d8b23fc4159b5afa489d6cfd388? [y/n]
-				// y
-				// 🌀  Deleting namespace 2a7d3d8b23fc4159b5afa489d6cfd388
-				// ✨  Success
-				// ⚠️  Make sure to remove this "kv-namespace" entry from your configuration file!
-				// ➜  test-mf
-
-				// TODO: do it automatically
-
-				// TODO: delete the preview namespace as well?
-			}
-		);
-}
-
-export const kvKey = (kvYargs: CommonYargsArgv) => {
-	return kvYargs
-		.command(
-			"put <key> [value]",
-			"Writes a single key/value pair to the given namespace.",
-			(yargs) => {
-				return yargs
-					.positional("key", {
-						type: "string",
-						describe: "The key to write to",
-						demandOption: true,
-					})
-					.positional("value", {
-						type: "string",
-						describe: "The value to write",
-					})
-					.option("binding", {
-						type: "string",
-						requiresArg: true,
-						describe: "The binding of the namespace to write to",
-					})
-					.option("namespace-id", {
-						type: "string",
-						requiresArg: true,
-						describe: "The id of the namespace to write to",
-					})
-					.check(demandOneOfOption("binding", "namespace-id"))
-					.option("preview", {
-						type: "boolean",
-						describe: "Interact with a preview namespace",
-					})
-					.option("ttl", {
-						type: "number",
-						describe: "Time for which the entries should be visible",
-					})
-					.option("expiration", {
-						type: "number",
-						describe: "Time since the UNIX epoch after which the entry expires",
-					})
-					.option("metadata", {
-						type: "string",
-						describe: "Arbitrary JSON that is associated with a key",
-						coerce: (jsonStr: string): KeyValue["metadata"] => {
-							try {
-								return JSON.parse(jsonStr);
-							} catch (_) {}
-						},
-					})
-					.option("path", {
-						type: "string",
-						requiresArg: true,
-						describe: "Read value from the file at a given path",
-					})
-					.option("local", {
-						type: "boolean",
-						describe: "Interact with local storage",
-					})
-					.option("persist-to", {
-						type: "string",
-						describe: "Directory for local persistence",
-					})
-					.check(demandOneOfOption("value", "path"));
+					return JSON.parse(jsonStr);
+				} catch {}
 			},
-			async ({ key, ttl, expiration, metadata, ...args }) => {
-				await printWranglerBanner();
-				const config = readConfig(args.config, args);
-				const namespaceId = getKVNamespaceId(args, config);
-				// One of `args.path` and `args.value` must be defined
-				const value = args.path
-					? readFileSyncToBuffer(args.path)
-					: // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-					  args.value!;
+		},
+		path: {
+			type: "string",
+			requiresArg: true,
+			describe: "Read value from the file at a given path",
+		},
+		local: {
+			type: "boolean",
+			describe: "Interact with local storage",
+		},
+		remote: {
+			type: "boolean",
+			describe: "Interact with remote storage",
+			conflicts: "local",
+		},
+		"persist-to": {
+			type: "string",
+			describe: "Directory for local persistence",
+		},
+	},
+	validateArgs(args) {
+		demandOneOfOption("binding", "namespace-id")(args);
+		demandOneOfOption("value", "path")(args);
+	},
 
-				const metadataLog = metadata
-					? ` with metadata "${JSON.stringify(metadata)}"`
-					: "";
+	async handler({ key, ttl, expiration, metadata, ...args }) {
+		const localMode = isLocal(args);
+		const config = readConfig(args);
+		const namespaceId = getKVNamespaceId(args, config);
+		// One of `args.path` and `args.value` must be defined
+		const value = args.path
+			? readFileSyncToBuffer(args.path)
+			: // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+				args.value!;
 
-				if (args.path) {
-					logger.log(
-						`Writing the contents of ${args.path} to the key "${key}" on namespace ${namespaceId}${metadataLog}.`
-					);
-				} else {
-					logger.log(
-						`Writing the value "${value}" to key "${key}" on namespace ${namespaceId}${metadataLog}.`
-					);
-				}
+		const metadataLog = metadata
+			? ` with metadata "${JSON.stringify(metadata)}"`
+			: "";
 
-				let metricEvent: EventNames;
-				if (args.local) {
-					await usingLocalNamespace(
-						args.persistTo,
-						config.configPath,
-						namespaceId,
-						(namespace) =>
-							namespace.put(key, new Blob([value]).stream(), {
-								expiration,
-								expirationTtl: ttl,
-								metadata,
-							})
-					);
+		if (args.path) {
+			logger.log(
+				`Writing the contents of ${args.path} to the key "${key}" on namespace ${namespaceId}${metadataLog}.`
+			);
+		} else {
+			logger.log(
+				`Writing the value "${value}" to key "${key}" on namespace ${namespaceId}${metadataLog}.`
+			);
+		}
 
-					metricEvent = "write kv key-value (local)";
-				} else {
-					const accountId = await requireAuth(config);
-
-					await putKVKeyValue(accountId, namespaceId, {
-						key,
-						value,
+		let metricEvent: EventNames;
+		if (localMode) {
+			await usingLocalNamespace(
+				args.persistTo,
+				config,
+				namespaceId,
+				(namespace) =>
+					namespace.put(key, new Blob([value]).stream(), {
 						expiration,
-						expiration_ttl: ttl,
-						metadata: metadata as KeyValue["metadata"],
-					});
+						expirationTtl: ttl,
+						metadata,
+					})
+			);
 
-					metricEvent = "write kv key-value";
+			metricEvent = "write kv key-value (local)";
+		} else {
+			const accountId = await requireAuth(config);
+
+			await putKVKeyValue(config, accountId, namespaceId, {
+				key,
+				value,
+				expiration,
+				expiration_ttl: ttl,
+				metadata: metadata as KeyValue["metadata"],
+			});
+
+			metricEvent = "write kv key-value";
+		}
+
+		metrics.sendMetricsEvent(metricEvent, {
+			sendMetrics: config.send_metrics,
+		});
+	},
+});
+
+export const kvKeyListCommand = createCommand({
+	metadata: {
+		description: "Output a list of all keys in a given namespace",
+		status: "stable",
+		owner: "Product: KV",
+	},
+	behaviour: {
+		// implicitly expects to output JSON only
+		printResourceLocation: false,
+		printBanner: false,
+	},
+
+	args: {
+		binding: {
+			type: "string",
+			requiresArg: true,
+			describe: "The binding name to the namespace to list",
+		},
+		"namespace-id": {
+			type: "string",
+			requiresArg: true,
+			describe: "The id of the namespace to list",
+		},
+		preview: {
+			type: "boolean",
+			// In the case of listing keys we will default to non-preview mode
+			default: false,
+			describe: "Interact with a preview namespace",
+		},
+		prefix: {
+			type: "string",
+			requiresArg: true,
+			describe: "A prefix to filter listed keys",
+		},
+		local: {
+			type: "boolean",
+			describe: "Interact with local storage",
+		},
+		remote: {
+			type: "boolean",
+			describe: "Interact with remote storage",
+			conflicts: "local",
+		},
+		"persist-to": {
+			type: "string",
+			describe: "Directory for local persistence",
+		},
+	},
+	validateArgs(args) {
+		demandOneOfOption("binding", "namespace-id")(args);
+	},
+
+	async handler({ prefix, ...args }) {
+		const localMode = isLocal(args);
+		// TODO: support for limit+cursor (pagination)
+		const config = readConfig(args);
+		const namespaceId = getKVNamespaceId(args, config);
+
+		let result: NamespaceKeyInfo[];
+		let metricEvent: EventNames;
+		if (localMode) {
+			const listResult = await usingLocalNamespace(
+				args.persistTo,
+				config,
+				namespaceId,
+				(namespace) => namespace.list({ prefix })
+			);
+			result = listResult.keys as NamespaceKeyInfo[];
+
+			metricEvent = "list kv keys (local)";
+		} else {
+			const accountId = await requireAuth(config);
+
+			result = await listKVNamespaceKeys(
+				config,
+				accountId,
+				namespaceId,
+				prefix
+			);
+			metricEvent = "list kv keys";
+		}
+
+		logger.log(JSON.stringify(result, undefined, 2));
+		metrics.sendMetricsEvent(metricEvent, {
+			sendMetrics: config.send_metrics,
+		});
+	},
+});
+
+export const kvKeyGetCommand = createCommand({
+	metadata: {
+		description: "Read a single value by key from the given namespace",
+		status: "stable",
+		owner: "Product: KV",
+	},
+	behaviour: {
+		printBanner: false,
+		printResourceLocation: false,
+	},
+	positionalArgs: ["key"],
+	args: {
+		key: {
+			describe: "The key value to get.",
+			type: "string",
+			demandOption: true,
+		},
+		binding: {
+			type: "string",
+			requiresArg: true,
+			describe: "The binding name to the namespace to get from",
+		},
+		"namespace-id": {
+			type: "string",
+			requiresArg: true,
+			describe: "The id of the namespace to get from",
+		},
+		preview: {
+			type: "boolean",
+			// In the case of getting key values we will default to non-preview mode
+			default: false,
+			describe: "Interact with a preview namespace",
+		},
+		text: {
+			type: "boolean",
+			default: false,
+			describe: "Decode the returned value as a utf8 string",
+		},
+		local: {
+			type: "boolean",
+			describe: "Interact with local storage",
+		},
+		remote: {
+			type: "boolean",
+			describe: "Interact with remote storage",
+			conflicts: "local",
+		},
+		"persist-to": {
+			type: "string",
+			describe: "Directory for local persistence",
+		},
+	},
+	validateArgs(args) {
+		demandOneOfOption("binding", "namespace-id")(args);
+	},
+	async handler({ key, ...args }) {
+		const localMode = isLocal(args);
+		const config = readConfig(args);
+		const namespaceId = getKVNamespaceId(args, config);
+
+		let bufferKVValue;
+		let metricEvent: EventNames;
+		if (localMode) {
+			const val = await usingLocalNamespace(
+				args.persistTo,
+				config,
+				namespaceId,
+				async (namespace) => {
+					const stream = await namespace.get(key, "stream");
+					// Note `stream` is only valid inside this closure
+					return stream === null ? null : await arrayBuffer(stream);
 				}
+			);
 
-				await metrics.sendMetricsEvent(metricEvent, {
-					sendMetrics: config.send_metrics,
-				});
+			if (val === null) {
+				logger.log("Value not found");
+				return;
 			}
-		)
-		.command(
-			"list",
-			"Outputs a list of all keys in a given namespace.",
-			(yargs) => {
-				return yargs
-					.option("binding", {
-						type: "string",
-						requiresArg: true,
-						describe: "The name of the namespace to list",
-					})
-					.option("namespace-id", {
-						type: "string",
-						requiresArg: true,
-						describe: "The id of the namespace to list",
-					})
-					.check(demandOneOfOption("binding", "namespace-id"))
-					.option("preview", {
-						type: "boolean",
-						// In the case of listing keys we will default to non-preview mode
-						default: false,
-						describe: "Interact with a preview namespace",
-					})
-					.option("prefix", {
-						type: "string",
-						requiresArg: true,
-						describe: "A prefix to filter listed keys",
-					})
-					.option("local", {
-						type: "boolean",
-						describe: "Interact with local storage",
-					})
-					.option("persist-to", {
-						type: "string",
-						describe: "Directory for local persistence",
-					});
-			},
-			async ({ prefix, ...args }) => {
-				// TODO: support for limit+cursor (pagination)
-				const config = readConfig(args.config, args);
-				const namespaceId = getKVNamespaceId(args, config);
 
-				let result: NamespaceKeyInfo[];
-				let metricEvent: EventNames;
-				if (args.local) {
-					const listResult = await usingLocalNamespace(
-						args.persistTo,
-						config.configPath,
-						namespaceId,
-						(namespace) => namespace.list({ prefix })
-					);
-					result = listResult.keys as NamespaceKeyInfo[];
+			bufferKVValue = Buffer.from(val);
+			metricEvent = "read kv value (local)";
+		} else {
+			const accountId = await requireAuth(config);
+			bufferKVValue = Buffer.from(
+				await getKVKeyValue(config, accountId, namespaceId, key)
+			);
 
-					metricEvent = "list kv keys (local)";
-				} else {
-					const accountId = await requireAuth(config);
+			metricEvent = "read kv value";
+		}
 
-					result = await listKVNamespaceKeys(accountId, namespaceId, prefix);
-					metricEvent = "list kv keys";
-				}
+		if (args.text) {
+			const decoder = new StringDecoder("utf8");
+			logger.log(decoder.write(bufferKVValue));
+		} else {
+			process.stdout.write(bufferKVValue);
+		}
+		metrics.sendMetricsEvent(metricEvent, {
+			sendMetrics: config.send_metrics,
+		});
+	},
+});
 
-				logger.log(JSON.stringify(result, undefined, 2));
-				await metrics.sendMetricsEvent(metricEvent, {
-					sendMetrics: config.send_metrics,
-				});
+export const kvKeyDeleteCommand = createCommand({
+	metadata: {
+		description: "Remove a single key value pair from the given namespace",
+		status: "stable",
+		owner: "Product: KV",
+	},
+	behaviour: {
+		printResourceLocation: true,
+	},
+	positionalArgs: ["key"],
+	args: {
+		key: {
+			describe: "The key value to delete.",
+			type: "string",
+			demandOption: true,
+		},
+		binding: {
+			type: "string",
+			requiresArg: true,
+			describe: "The binding name to the namespace to delete from",
+		},
+		"namespace-id": {
+			type: "string",
+			requiresArg: true,
+			describe: "The id of the namespace to delete from",
+		},
+		preview: {
+			type: "boolean",
+			describe: "Interact with a preview namespace",
+		},
+		local: {
+			type: "boolean",
+			describe: "Interact with local storage",
+		},
+		remote: {
+			type: "boolean",
+			describe: "Interact with remote storage",
+			conflicts: "local",
+		},
+		"persist-to": {
+			type: "string",
+			describe: "Directory for local persistence",
+		},
+	},
+
+	async handler({ key, ...args }) {
+		const localMode = isLocal(args);
+		const config = readConfig(args);
+		const namespaceId = getKVNamespaceId(args, config);
+
+		logger.log(`Deleting the key "${key}" on namespace ${namespaceId}.`);
+
+		let metricEvent: EventNames;
+		if (localMode) {
+			await usingLocalNamespace(
+				args.persistTo,
+				config,
+				namespaceId,
+				(namespace) => namespace.delete(key)
+			);
+
+			metricEvent = "delete kv key-value (local)";
+		} else {
+			const accountId = await requireAuth(config);
+
+			await deleteKVKeyValue(config, accountId, namespaceId, key);
+			metricEvent = "delete kv key-value";
+		}
+		metrics.sendMetricsEvent(metricEvent, {
+			sendMetrics: config.send_metrics,
+		});
+	},
+});
+
+export const kvBulkGetCommand = createCommand({
+	metadata: {
+		description: "Gets multiple key-value pairs from a namespace",
+		status: "open-beta",
+		owner: "Product: KV",
+	},
+	behaviour: {
+		printBanner: false,
+		printResourceLocation: false,
+	},
+	positionalArgs: ["filename"],
+	args: {
+		filename: {
+			describe: "The file containing the keys to get",
+			type: "string",
+			demandOption: true,
+		},
+		binding: {
+			type: "string",
+			requiresArg: true,
+			describe: "The binding name to the namespace to get from",
+		},
+		"namespace-id": {
+			type: "string",
+			requiresArg: true,
+			describe: "The id of the namespace to get from",
+		},
+		preview: {
+			type: "boolean",
+			describe: "Interact with a preview namespace",
+		},
+		local: {
+			type: "boolean",
+			describe: "Interact with local storage",
+		},
+		remote: {
+			type: "boolean",
+			describe: "Interact with remote storage",
+			conflicts: "local",
+		},
+		"persist-to": {
+			type: "string",
+			describe: "Directory for local persistence",
+		},
+	},
+
+	async handler({ filename, ...args }) {
+		const localMode = isLocal(args);
+		const config = readConfig(args);
+		const namespaceId = getKVNamespaceId(args, config);
+
+		const content = parseJSON(readFileSync(filename), filename) as (
+			| string
+			| { name: string }
+		)[];
+
+		if (!Array.isArray(content)) {
+			throw new UserError(
+				`Unexpected JSON input from "${filename}".\n` +
+					`Expected an array of strings but got:\n${content}`
+			);
+		}
+
+		const errors: string[] = [];
+
+		const keysToGet: string[] = [];
+		for (const [index, item] of content.entries()) {
+			const key = typeof item !== "string" ? item?.name : item;
+
+			if (typeof key !== "string") {
+				errors.push(
+					`The item at index ${index} is type: "${typeof item}" - ${JSON.stringify(
+						item
+					)}`
+				);
+				continue;
 			}
-		)
-		.command(
-			"get <key>",
-			"Reads a single value by key from the given namespace.",
-			(yargs) => {
-				return yargs
-					.positional("key", {
-						describe: "The key value to get.",
-						type: "string",
-						demandOption: true,
-					})
-					.option("binding", {
-						type: "string",
-						requiresArg: true,
-						describe: "The name of the namespace to get from",
-					})
-					.option("namespace-id", {
-						type: "string",
-						requiresArg: true,
-						describe: "The id of the namespace to get from",
-					})
-					.check(demandOneOfOption("binding", "namespace-id"))
-					.option("preview", {
-						type: "boolean",
-						describe: "Interact with a preview namespace",
-					})
-					.option("preview", {
-						type: "boolean",
-						// In the case of getting key values we will default to non-preview mode
-						default: false,
-						describe: "Interact with a preview namespace",
-					})
-					.option("text", {
-						type: "boolean",
-						default: false,
-						describe: "Decode the returned value as a utf8 string",
-					})
-					.option("local", {
-						type: "boolean",
-						describe: "Interact with local storage",
-					})
-					.option("persist-to", {
-						type: "string",
-						describe: "Directory for local persistence",
-					});
-			},
-			async ({ key, ...args }) => {
-				const config = readConfig(args.config, args);
-				const namespaceId = getKVNamespaceId(args, config);
+			keysToGet.push(key);
+		}
 
-				let bufferKVValue;
-				let metricEvent: EventNames;
-				if (args.local) {
-					const val = await usingLocalNamespace(
-						args.persistTo,
-						config.configPath,
-						namespaceId,
-						async (namespace) => {
-							const stream = await namespace.get(key, "stream");
-							// Note `stream` is only valid inside this closure
-							return stream === null ? null : await arrayBuffer(stream);
-						}
-					);
+		if (errors.length > 0) {
+			throw new UserError(
+				`Unexpected JSON input from "${filename}".\n` +
+					`Expected an array of strings or objects with a "name" key.\n` +
+					errors.join("\n")
+			);
+		}
 
-					if (val === null) {
-						logger.log("Value not found");
-						return;
+		if (localMode) {
+			const result = await usingLocalNamespace(
+				args.persistTo,
+				config,
+				namespaceId,
+				async (namespace) => {
+					const out = {} as { [key: string]: { value: string | null } };
+					for (const key of keysToGet) {
+						const value = await namespace.get(key, "text");
+
+						out[key as string] = {
+							value,
+						};
 					}
-
-					bufferKVValue = Buffer.from(val);
-					metricEvent = "read kv value (local)";
-				} else {
-					const accountId = await requireAuth(config);
-					bufferKVValue = Buffer.from(
-						await getKVKeyValue(accountId, namespaceId, key)
-					);
-
-					metricEvent = "read kv value";
+					return out;
 				}
+			);
 
-				if (args.text) {
-					const decoder = new StringDecoder("utf8");
-					logger.log(decoder.write(bufferKVValue));
-				} else {
-					process.stdout.write(bufferKVValue);
-				}
-				await metrics.sendMetricsEvent(metricEvent, {
-					sendMetrics: config.send_metrics,
-				});
-			}
-		)
-		.command(
-			"delete <key>",
-			"Removes a single key value pair from the given namespace.",
-			(yargs) => {
-				return yargs
-					.positional("key", {
-						describe: "The key value to delete",
-						type: "string",
-						demandOption: true,
-					})
-					.option("binding", {
-						type: "string",
-						requiresArg: true,
-						describe: "The name of the namespace to delete from",
-					})
-					.option("namespace-id", {
-						type: "string",
-						requiresArg: true,
-						describe: "The id of the namespace to delete from",
-					})
-					.check(demandOneOfOption("binding", "namespace-id"))
-					.option("preview", {
-						type: "boolean",
-						describe: "Interact with a preview namespace",
-					})
-					.option("local", {
-						type: "boolean",
-						describe: "Interact with local storage",
-					})
-					.option("persist-to", {
-						type: "string",
-						describe: "Directory for local persistence",
-					});
+			logger.log(JSON.stringify(result, null, 2));
+		} else {
+			const accountId = await requireAuth(config);
+
+			logger.log(
+				JSON.stringify(
+					await getKVBulkKeyValue(config, accountId, namespaceId, keysToGet),
+					null,
+					2
+				)
+			);
+		}
+		logger.log("\nSuccess!");
+	},
+});
+
+export const kvBulkPutCommand = createCommand({
+	metadata: {
+		description: "Upload multiple key-value pairs to a namespace",
+		status: "stable",
+		owner: "Product: KV",
+	},
+	behaviour: {
+		printResourceLocation: true,
+	},
+	positionalArgs: ["filename"],
+	args: {
+		filename: {
+			describe: "The file containing the key/value pairs to write",
+			type: "string",
+			demandOption: true,
+		},
+		binding: {
+			type: "string",
+			requiresArg: true,
+			describe: "The binding name to the namespace to write to",
+		},
+		"namespace-id": {
+			type: "string",
+			requiresArg: true,
+			describe: "The id of the namespace to write to",
+		},
+		preview: {
+			type: "boolean",
+			describe: "Interact with a preview namespace",
+		},
+		ttl: {
+			type: "number",
+			describe: "Time for which the entries should be visible",
+		},
+		expiration: {
+			type: "number",
+			describe: "Time since the UNIX epoch after which the entry expires",
+		},
+		metadata: {
+			type: "string",
+			describe: "Arbitrary JSON that is associated with a key",
+			coerce: (jsonStr: string): KeyValue["metadata"] => {
+				try {
+					return JSON.parse(jsonStr);
+				} catch {}
 			},
-			async ({ key, ...args }) => {
-				await printWranglerBanner();
-				const config = readConfig(args.config, args);
-				const namespaceId = getKVNamespaceId(args, config);
+		},
+		local: {
+			type: "boolean",
+			describe: "Interact with local storage",
+		},
+		remote: {
+			type: "boolean",
+			describe: "Interact with remote storage",
+			conflicts: "local",
+		},
+		"persist-to": {
+			type: "string",
+			describe: "Directory for local persistence",
+		},
+	},
 
-				logger.log(`Deleting the key "${key}" on namespace ${namespaceId}.`);
+	async handler({ filename, ...args }) {
+		const localMode = isLocal(args);
+		// The simplest implementation I could think of.
+		// This could be made more efficient with a streaming parser/uploader
+		// but we'll do that in the future if needed.
 
-				let metricEvent: EventNames;
-				if (args.local) {
-					await usingLocalNamespace(
-						args.persistTo,
-						config.configPath,
-						namespaceId,
-						(namespace) => namespace.delete(key)
-					);
+		const config = readConfig(args);
+		const namespaceId = getKVNamespaceId(args, config);
+		const content = parseJSON(readFileSync(filename), filename);
 
-					metricEvent = "delete kv key-value (local)";
+		if (!Array.isArray(content)) {
+			throw new UserError(
+				`Unexpected JSON input from "${filename}".\n` +
+					`Expected an array of key-value objects but got type "${typeof content}".`
+			);
+		}
+
+		let maxNumberOfErrorsReached = false;
+		const errors: string[] = [];
+		let maxNumberOfWarningsReached = false;
+		const warnings: string[] = [];
+		for (let i = 0; i < content.length; i++) {
+			const keyValue = content[i];
+			if (!isKVKeyValue(keyValue) && !maxNumberOfErrorsReached) {
+				if (errors.length === BATCH_MAX_ERRORS_WARNINGS) {
+					maxNumberOfErrorsReached = true;
+					errors.push("...");
 				} else {
-					const accountId = await requireAuth(config);
-
-					await deleteKVKeyValue(accountId, namespaceId, key);
-					metricEvent = "delete kv key-value";
+					errors.push(`The item at index ${i} is ${JSON.stringify(keyValue)}`);
 				}
-				await metrics.sendMetricsEvent(metricEvent, {
-					sendMetrics: config.send_metrics,
-				});
-			}
-		);
-};
-
-export const kvBulk = (kvYargs: CommonYargsArgv) => {
-	return kvYargs
-		.command(
-			"put <filename>",
-			"Upload multiple key-value pairs to a namespace",
-			(yargs) => {
-				return yargs
-					.positional("filename", {
-						describe: `The JSON file of key-value pairs to upload, in form [{"key":..., "value":...}"...]`,
-						type: "string",
-						demandOption: true,
-					})
-					.option("binding", {
-						type: "string",
-						requiresArg: true,
-						describe: "The name of the namespace to insert values into",
-					})
-					.option("namespace-id", {
-						type: "string",
-						requiresArg: true,
-						describe: "The id of the namespace to insert values into",
-					})
-					.check(demandOneOfOption("binding", "namespace-id"))
-					.option("preview", {
-						type: "boolean",
-						describe: "Interact with a preview namespace",
-					})
-					.option("local", {
-						type: "boolean",
-						describe: "Interact with local storage",
-					})
-					.option("persist-to", {
-						type: "string",
-						describe: "Directory for local persistence",
-					});
-			},
-			async ({ filename, ...args }) => {
-				await printWranglerBanner();
-				// The simplest implementation I could think of.
-				// This could be made more efficient with a streaming parser/uploader
-				// but we'll do that in the future if needed.
-
-				const config = readConfig(args.config, args);
-				const namespaceId = getKVNamespaceId(args, config);
-				const content = parseJSON(readFileSync(filename), filename);
-
-				if (!Array.isArray(content)) {
-					throw new UserError(
-						`Unexpected JSON input from "${filename}".\n` +
-							`Expected an array of key-value objects but got type "${typeof content}".`
-					);
-				}
-
-				const errors: string[] = [];
-				const warnings: string[] = [];
-				for (let i = 0; i < content.length; i++) {
-					const keyValue = content[i];
-					if (!isKVKeyValue(keyValue)) {
-						errors.push(
-							`The item at index ${i} is ${JSON.stringify(keyValue)}`
-						);
+			} else {
+				const props = unexpectedKVKeyValueProps(keyValue);
+				if (props.length > 0 && !maxNumberOfWarningsReached) {
+					if (warnings.length === BATCH_MAX_ERRORS_WARNINGS) {
+						maxNumberOfWarningsReached = true;
+						warnings.push("...");
 					} else {
-						const props = unexpectedKVKeyValueProps(keyValue);
-						if (props.length > 0) {
-							warnings.push(
-								`The item at index ${i} contains unexpected properties: ${JSON.stringify(
-									props
-								)}.`
-							);
-						}
-					}
-				}
-				if (warnings.length > 0) {
-					logger.warn(
-						`Unexpected key-value properties in "${filename}".\n` +
-							warnings.join("\n")
-					);
-				}
-				if (errors.length > 0) {
-					throw new UserError(
-						`Unexpected JSON input from "${filename}".\n` +
-							`Each item in the array should be an object that matches:\n\n` +
-							`interface KeyValue {\n` +
-							`  key: string;\n` +
-							`  value: string;\n` +
-							`  expiration?: number;\n` +
-							`  expiration_ttl?: number;\n` +
-							`  metadata?: object;\n` +
-							`  base64?: boolean;\n` +
-							`}\n\n` +
-							errors.join("\n")
-					);
-				}
-
-				let metricEvent: EventNames;
-				if (args.local) {
-					await usingLocalNamespace(
-						args.persistTo,
-						config.configPath,
-						namespaceId,
-						async (namespace) => {
-							for (const value of content) {
-								await namespace.put(value.key, value.value, {
-									expiration: value.expiration,
-									expirationTtl: value.expiration_ttl,
-									metadata: value.metadata,
-								});
-							}
-						}
-					);
-
-					metricEvent = "write kv key-values (bulk) (local)";
-				} else {
-					const accountId = await requireAuth(config);
-
-					await putKVBulkKeyValue(accountId, namespaceId, content);
-					metricEvent = "write kv key-values (bulk)";
-				}
-
-				await metrics.sendMetricsEvent(metricEvent, {
-					sendMetrics: config.send_metrics,
-				});
-				logger.log("Success!");
-			}
-		)
-		.command(
-			"delete <filename>",
-			"Delete multiple key-value pairs from a namespace",
-			(yargs) => {
-				return yargs
-					.positional("filename", {
-						describe: `The JSON file of keys to delete, in the form ["key1", "key2", ...]`,
-						type: "string",
-						demandOption: true,
-					})
-					.option("binding", {
-						type: "string",
-						requiresArg: true,
-						describe: "The name of the namespace to delete from",
-					})
-					.option("namespace-id", {
-						type: "string",
-						requiresArg: true,
-						describe: "The id of the namespace to delete from",
-					})
-					.check(demandOneOfOption("binding", "namespace-id"))
-					.option("preview", {
-						type: "boolean",
-						describe: "Interact with a preview namespace",
-					})
-					.option("force", {
-						type: "boolean",
-						alias: "f",
-						describe: "Do not ask for confirmation before deleting",
-					})
-					.option("local", {
-						type: "boolean",
-						describe: "Interact with local storage",
-					})
-					.option("persist-to", {
-						type: "string",
-						describe: "Directory for local persistence",
-					});
-			},
-			async ({ filename, ...args }) => {
-				await printWranglerBanner();
-				const config = readConfig(args.config, args);
-				const namespaceId = getKVNamespaceId(args, config);
-
-				if (!args.force) {
-					const result = await confirm(
-						`Are you sure you want to delete all the keys read from "${filename}" from kv-namespace with id "${namespaceId}"?`
-					);
-					if (!result) {
-						logger.log(`Not deleting keys read from "${filename}".`);
-						return;
-					}
-				}
-
-				const content = parseJSON(readFileSync(filename), filename) as string[];
-
-				if (!Array.isArray(content)) {
-					throw new UserError(
-						`Unexpected JSON input from "${filename}".\n` +
-							`Expected an array of strings but got:\n${content}`
-					);
-				}
-
-				const errors: string[] = [];
-				for (let i = 0; i < content.length; i++) {
-					const key = content[i];
-					if (typeof key !== "string") {
-						errors.push(
-							`The item at index ${i} is type: "${typeof key}" - ${JSON.stringify(
-								key
-							)}`
+						warnings.push(
+							`The item at index ${i} contains unexpected properties: ${JSON.stringify(
+								props
+							)}.`
 						);
 					}
 				}
-
-				if (errors.length > 0) {
-					throw new UserError(
-						`Unexpected JSON input from "${filename}".\n` +
-							`Expected an array of strings.\n` +
-							errors.join("\n")
-					);
-				}
-
-				let metricEvent: EventNames;
-				if (args.local) {
-					await usingLocalNamespace(
-						args.persistTo,
-						config.configPath,
-						namespaceId,
-						async (namespace) => {
-							for (const key of content) await namespace.delete(key);
-						}
-					);
-
-					metricEvent = "delete kv key-values (bulk) (local)";
-				} else {
-					const accountId = await requireAuth(config);
-
-					await deleteKVBulkKeyValue(accountId, namespaceId, content);
-					metricEvent = "delete kv key-values (bulk)";
-				}
-
-				await metrics.sendMetricsEvent(metricEvent, {
-					sendMetrics: config.send_metrics,
-				});
-
-				logger.log("Success!");
 			}
-		);
-};
+		}
+		if (warnings.length > 0) {
+			logger.warn(
+				`Unexpected key-value properties in "${filename}".\n` +
+					warnings.join("\n")
+			);
+		}
+		if (errors.length > 0) {
+			throw new UserError(
+				`Unexpected JSON input from "${filename}".\n` +
+					`Each item in the array should be an object that matches:\n\n` +
+					`interface KeyValue {\n` +
+					`  key: string;\n` +
+					`  value: string;\n` +
+					`  expiration?: number;\n` +
+					`  expiration_ttl?: number;\n` +
+					`  metadata?: object;\n` +
+					`  base64?: boolean;\n` +
+					`}\n\n` +
+					errors.join("\n")
+			);
+		}
+
+		let metricEvent: EventNames;
+		if (localMode) {
+			await usingLocalNamespace(
+				args.persistTo,
+				config,
+				namespaceId,
+				async (namespace) => {
+					for (const value of content) {
+						let data = value.value;
+						if (value.base64) {
+							data = Buffer.from(data, "base64").toString();
+						}
+						await namespace.put(value.key, data, {
+							expiration: value.expiration,
+							expirationTtl: value.expiration_ttl,
+							metadata: value.metadata,
+						});
+					}
+				}
+			);
+
+			metricEvent = "write kv key-values (bulk) (local)";
+		} else {
+			const accountId = await requireAuth(config);
+
+			await putKVBulkKeyValue(config, accountId, namespaceId, content);
+			metricEvent = "write kv key-values (bulk)";
+		}
+
+		metrics.sendMetricsEvent(metricEvent, {
+			sendMetrics: config.send_metrics,
+		});
+		logger.log("Success!");
+	},
+});
+
+export const kvBulkDeleteCommand = createCommand({
+	metadata: {
+		description: "Delete multiple key-value pairs from a namespace",
+		status: "stable",
+		owner: "Product: KV",
+	},
+	behaviour: {
+		printResourceLocation: true,
+	},
+	positionalArgs: ["filename"],
+	args: {
+		filename: {
+			describe: "The file containing the keys to delete",
+			type: "string",
+			demandOption: true,
+		},
+		binding: {
+			type: "string",
+			requiresArg: true,
+			describe: "The binding name to the namespace to delete from",
+		},
+		"namespace-id": {
+			type: "string",
+			requiresArg: true,
+			describe: "The id of the namespace to delete from",
+		},
+		preview: {
+			type: "boolean",
+			describe: "Interact with a preview namespace",
+		},
+		force: {
+			type: "boolean",
+			alias: "f",
+			describe: "Do not ask for confirmation before deleting",
+		},
+		local: {
+			type: "boolean",
+			describe: "Interact with local storage",
+		},
+		remote: {
+			type: "boolean",
+			describe: "Interact with remote storage",
+			conflicts: "local",
+		},
+		"persist-to": {
+			type: "string",
+			describe: "Directory for local persistence",
+		},
+	},
+
+	async handler({ filename, ...args }) {
+		const localMode = isLocal(args);
+		const config = readConfig(args);
+		const namespaceId = getKVNamespaceId(args, config);
+
+		if (!args.force) {
+			const result = await confirm(
+				`Are you sure you want to delete all the keys read from "${filename}" from kv-namespace with id "${namespaceId}"?`
+			);
+			if (!result) {
+				logger.log(`Not deleting keys read from "${filename}".`);
+				return;
+			}
+		}
+
+		const content = parseJSON(readFileSync(filename), filename) as (
+			| string
+			| { name: string }
+		)[];
+
+		if (!Array.isArray(content)) {
+			throw new UserError(
+				`Unexpected JSON input from "${filename}".\n` +
+					`Expected an array of strings but got:\n${content}`
+			);
+		}
+
+		const errors: string[] = [];
+
+		const keysToDelete: string[] = [];
+		for (const [index, item] of content.entries()) {
+			const key = typeof item !== "string" ? item?.name : item;
+
+			if (typeof key !== "string") {
+				errors.push(
+					`The item at index ${index} is type: "${typeof item}" - ${JSON.stringify(
+						item
+					)}`
+				);
+			}
+			keysToDelete.push(key);
+		}
+
+		if (errors.length > 0) {
+			throw new UserError(
+				`Unexpected JSON input from "${filename}".\n` +
+					`Expected an array of strings or objects with a "name" key.\n` +
+					errors.join("\n")
+			);
+		}
+
+		let metricEvent: EventNames;
+		if (localMode) {
+			await usingLocalNamespace(
+				args.persistTo,
+				config,
+				namespaceId,
+				async (namespace) => {
+					for (const key of keysToDelete) {
+						await namespace.delete(key);
+					}
+				}
+			);
+
+			metricEvent = "delete kv key-values (bulk) (local)";
+		} else {
+			const accountId = await requireAuth(config);
+
+			await deleteKVBulkKeyValue(config, accountId, namespaceId, keysToDelete);
+			metricEvent = "delete kv key-values (bulk)";
+		}
+
+		metrics.sendMetricsEvent(metricEvent, {
+			sendMetrics: config.send_metrics,
+		});
+
+		logger.log("Success!");
+	},
+});

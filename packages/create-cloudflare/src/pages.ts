@@ -1,4 +1,3 @@
-import { crash } from "@cloudflare/cli";
 import { brandColor, dim } from "@cloudflare/cli/colors";
 import { quoteShellArgs, runCommand } from "helpers/command";
 import { detectPackageManager } from "helpers/packageManagers";
@@ -15,10 +14,11 @@ const VERIFY_PROJECT_RETRIES = 3;
 const { npx } = detectPackageManager();
 
 export const createProject = async (ctx: C3Context) => {
-	if (ctx.template.platform === "workers") return;
-	if (!ctx.account?.id) {
-		crash("Failed to read Cloudflare account.");
+	if (ctx.template.platform === "workers") {
 		return;
+	}
+	if (!ctx.account?.id) {
+		throw new Error("Failed to read Cloudflare account.");
 	}
 	const CLOUDFLARE_ACCOUNT_ID = ctx.account.id;
 
@@ -47,7 +47,7 @@ export const createProject = async (ctx: C3Context) => {
 						e instanceof Error &&
 						// if the error is regarding name duplication we can exist as retrying is not going to help
 						e.message.includes(
-							"A project with this name already exists. Choose a different project name."
+							"A project with this name already exists. Choose a different project name.",
 						)
 					);
 				},
@@ -61,12 +61,12 @@ export const createProject = async (ctx: C3Context) => {
 					env: { CLOUDFLARE_ACCOUNT_ID },
 					startText: "Creating Pages project",
 					doneText: `${brandColor("created")} ${dim(
-						`via \`${quoteShellArgs(cmd)}\``
+						`via \`${quoteShellArgs(cmd)}\``,
 					)}`,
-				})
+				}),
 		);
-	} catch (error) {
-		crash("Failed to create pages project. See output above.");
+	} catch {
+		throw new Error("Failed to create pages project. See output above.");
 	}
 
 	// Wait until the pages project is available for deployment
@@ -88,11 +88,13 @@ export const createProject = async (ctx: C3Context) => {
 				env: { CLOUDFLARE_ACCOUNT_ID },
 				startText: "Verifying Pages project",
 				doneText: `${brandColor("verified")} ${dim(
-					`project is ready for deployment`
+					`project is ready for deployment`,
 				)}`,
-			})
+			}),
 		);
-	} catch (error) {
-		crash("Pages project isn't ready yet. Please try deploying again later.");
+	} catch {
+		throw new Error(
+			"Pages project isn't ready yet. Please try deploying again later.",
+		);
 	}
 };

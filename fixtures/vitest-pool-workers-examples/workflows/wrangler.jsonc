@@ -1,0 +1,12 @@
+{
+	"name": "workflows",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-02-04",
+	"workflows": [
+		{
+			"binding": "MODERATOR",
+			"class_name": "ModeratorWorkflow",
+			"name": "moderator-workflow",
+		},
+	],
+}

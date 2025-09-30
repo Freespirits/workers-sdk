@@ -1,25 +1,26 @@
 import assert from "node:assert";
 import { randomUUID } from "node:crypto";
-import { EventEmitter } from "node:events";
+import events from "node:events";
 import path from "node:path";
-import { LogLevel, Miniflare, Mutex, Response, WebSocket } from "miniflare";
+import { LogLevel, Miniflare, Mutex, Response } from "miniflare";
 import inspectorProxyWorkerPath from "worker:startDevWorker/InspectorProxyWorker";
 import proxyWorkerPath from "worker:startDevWorker/ProxyWorker";
+import WebSocket from "ws";
 import {
 	logConsoleMessage,
 	maybeHandleNetworkLoadResource,
 } from "../../dev/inspect";
-import {
-	castLogLevel,
-	handleRuntimeStdio,
-	WranglerLog,
-} from "../../dev/miniflare";
+import { castLogLevel, WranglerLog } from "../../dev/miniflare";
+import { handleRuntimeStdioWithStructuredLogs } from "../../dev/miniflare/stdio";
 import { getHttpsOptions } from "../../https-options";
 import { logger } from "../../logger";
 import { getSourceMappedStack } from "../../sourcemap";
+import { assertNever } from "../../utils/assert-never";
+import { Controller } from "./BaseController";
 import { castErrorCause } from "./events";
-import { assertNever, createDeferred } from "./utils";
+import { createDeferred } from "./utils";
 import type { EsbuildBundle } from "../../dev/use-esbuild";
+import type { ControllerEventMap } from "./BaseController";
 import type {
 	BundleStartEvent,
 	ConfigUpdateEvent,
@@ -38,30 +39,45 @@ import type {
 } from "./events";
 import type { StartDevWorkerOptions } from "./types";
 import type { DeferredPromise } from "./utils";
-import type { MiniflareOptions } from "miniflare";
+import type { LogOptions, MiniflareOptions } from "miniflare";
 
-export class ProxyController extends EventEmitter {
+type ProxyControllerEventMap = ControllerEventMap & {
+	ready: [ReadyEvent];
+	previewTokenExpired: [PreviewTokenExpiredEvent];
+};
+export class ProxyController extends Controller<ProxyControllerEventMap> {
 	public ready = createDeferred<ReadyEvent>();
+
+	public localServerReady = createDeferred<void>();
 
 	public proxyWorker?: Miniflare;
 	proxyWorkerOptions?: MiniflareOptions;
-	inspectorProxyWorkerWebSocket?: DeferredPromise<WebSocket>;
+	private inspectorProxyWorkerWebSocket?: DeferredPromise<WebSocket>;
 
 	protected latestConfig?: StartDevWorkerOptions;
 	protected latestBundle?: EsbuildBundle;
+
 	secret = randomUUID();
 
 	protected createProxyWorker() {
-		if (this._torndown) return;
+		if (this._torndown) {
+			return;
+		}
 		assert(this.latestConfig !== undefined);
+
+		// If we're in a JavaScript Debug terminal, Miniflare will send the inspector ports directly to VSCode for registration
+		// As such, we don't need our inspector proxy and in fact including it causes issue with multiple clients connected to the
+		// inspector endpoint.
+		const inVscodeJsDebugTerminal = !!process.env.VSCODE_INSPECTOR_OPTIONS;
 
 		const cert =
 			this.latestConfig.dev?.server?.secure ||
-			this.latestConfig.dev?.inspector?.secure
+			(this.latestConfig.dev.inspector !== false &&
+				this.latestConfig.dev?.inspector?.secure)
 				? getHttpsOptions(
 						this.latestConfig.dev.server?.httpsKeyPath,
 						this.latestConfig.dev.server?.httpsCertPath
-				  )
+					)
 				: undefined;
 
 		const proxyWorkerOptions: MiniflareOptions = {
@@ -70,7 +86,7 @@ export class ProxyController extends EventEmitter {
 			https: this.latestConfig.dev?.server?.secure,
 			httpsCert: cert?.cert,
 			httpsKey: cert?.key,
-
+			stripDisablePrettyError: false,
 			workers: [
 				{
 					name: "ProxyWorker",
@@ -84,6 +100,9 @@ export class ProxyController extends EventEmitter {
 							unsafePreventEviction: true,
 						},
 					},
+					// Miniflare will strip CF-Connecting-IP from outgoing fetches from a Worker (to fix https://github.com/cloudflare/workers-sdk/issues/7924)
+					// However, the proxy worker only makes outgoing requests to the user Worker Miniflare instance, which _should_ receive CF-Connecting-IP
+					stripCfConnectingIp: false,
 					serviceBindings: {
 						PROXY_CONTROLLER: async (req): Promise<Response> => {
 							const message =
@@ -102,49 +121,66 @@ export class ProxyController extends EventEmitter {
 					cache: false,
 					unsafeEphemeralDurableObjects: true,
 				},
-				{
-					name: "InspectorProxyWorker",
-					compatibilityDate: "2023-12-18",
-					compatibilityFlags: ["nodejs_compat"],
-					modulesRoot: path.dirname(inspectorProxyWorkerPath),
-					modules: [{ type: "ESModule", path: inspectorProxyWorkerPath }],
-					durableObjects: {
-						DURABLE_OBJECT: {
-							className: "InspectorProxyWorker",
-							unsafePreventEviction: true,
-						},
-					},
-					serviceBindings: {
-						PROXY_CONTROLLER: async (req): Promise<Response> => {
-							const body =
-								(await req.json()) as InspectorProxyWorkerOutgoingRequestBody;
-
-							return this.onInspectorProxyWorkerRequest(body);
-						},
-					},
-					bindings: {
-						PROXY_CONTROLLER_AUTH_SECRET: this.secret,
-					},
-
-					unsafeDirectHost: this.latestConfig.dev?.inspector?.hostname,
-					unsafeDirectPort: this.latestConfig.dev?.inspector?.port ?? 0,
-
-					// no need to use file-system, so don't
-					cache: false,
-					unsafeEphemeralDurableObjects: true,
-				},
 			],
 
 			verbose: logger.loggerLevel === "debug",
 
 			// log requests into the ProxyWorker (for local + remote mode)
-			log: new ProxyControllerLogger(castLogLevel(logger.loggerLevel), {
-				prefix:
-					// if debugging, log requests with specic ProxyWorker prefix
-					logger.loggerLevel === "debug" ? "wrangler-ProxyWorker" : "wrangler",
-			}),
-			handleRuntimeStdio,
+			log: new ProxyControllerLogger(
+				castLogLevel(logger.loggerLevel),
+				{
+					prefix:
+						// if debugging, log requests with specic ProxyWorker prefix
+						logger.loggerLevel === "debug"
+							? "wrangler-ProxyWorker"
+							: "wrangler",
+				},
+				this.localServerReady.promise
+			),
+			handleRuntimeStdio: handleRuntimeStdioWithStructuredLogs,
+			structuredWorkerdLogs: true,
+			liveReload: false,
 		};
+
+		if (this.latestConfig.dev.inspector !== false && !inVscodeJsDebugTerminal) {
+			proxyWorkerOptions.workers.push({
+				name: "InspectorProxyWorker",
+				compatibilityDate: "2023-12-18",
+				compatibilityFlags: [
+					"nodejs_compat",
+					"increase_websocket_message_size",
+				],
+				modulesRoot: path.dirname(inspectorProxyWorkerPath),
+				modules: [{ type: "ESModule", path: inspectorProxyWorkerPath }],
+				durableObjects: {
+					DURABLE_OBJECT: {
+						className: "InspectorProxyWorker",
+						unsafePreventEviction: true,
+					},
+				},
+				serviceBindings: {
+					PROXY_CONTROLLER: async (req): Promise<Response> => {
+						const body =
+							(await req.json()) as InspectorProxyWorkerOutgoingRequestBody;
+
+						return this.onInspectorProxyWorkerRequest(body);
+					},
+				},
+				bindings: {
+					PROXY_CONTROLLER_AUTH_SECRET: this.secret,
+				},
+
+				unsafeDirectSockets: [
+					{
+						host: this.latestConfig.dev?.inspector?.hostname,
+						port: this.latestConfig.dev?.inspector?.port ?? 0,
+					},
+				],
+				// no need to use file-system, so don't
+				cache: false,
+				unsafeEphemeralDurableObjects: true,
+			});
+		}
 
 		const proxyWorkerOptionsChanged = didMiniflareOptionsChange(
 			this.proxyWorkerOptions,
@@ -159,7 +195,9 @@ export class ProxyController extends EventEmitter {
 		if (proxyWorkerOptionsChanged) {
 			logger.debug("ProxyWorker miniflare options changed, reinstantiating...");
 
-			void this.proxyWorker.setOptions(proxyWorkerOptions);
+			void this.proxyWorker.setOptions(proxyWorkerOptions).catch((error) => {
+				this.emitErrorEvent("Failed to start ProxyWorker", error);
+			});
 
 			// this creates a new .ready promise that will be resolved when both ProxyWorkers are ready
 			// it also respects any await-ers of the existing .ready promise
@@ -172,12 +210,31 @@ export class ProxyController extends EventEmitter {
 		if (willInstantiateMiniflareInstance) {
 			void Promise.all([
 				proxyWorker.ready,
-				this.reconnectInspectorProxyWorker(),
+				this.latestConfig.dev.inspector === false || inVscodeJsDebugTerminal
+					? Promise.resolve(undefined)
+					: proxyWorker.unsafeGetDirectURL("InspectorProxyWorker"),
 			])
-				.then(() => {
-					this.emitReadyEvent(proxyWorker);
+				.then(([url, inspectorUrl]) => {
+					if (!inspectorUrl || inVscodeJsDebugTerminal) {
+						return [url, undefined];
+					}
+					// Don't connect the inspector proxy worker until we have a valid ready Miniflare instance.
+					// Otherwise, tearing down the ProxyController immediately after setting it up
+					// will result in proxyWorker.ready throwing, but reconnectInspectorProxyWorker hanging for ever,
+					// preventing teardown
+					return this.reconnectInspectorProxyWorker().then(() => [
+						url,
+						inspectorUrl,
+					]);
+				})
+				.then(([url, inspectorUrl]) => {
+					assert(url);
+					this.emitReadyEvent(proxyWorker, url, inspectorUrl);
 				})
 				.catch((error) => {
+					if (this._torndown) {
+						return;
+					}
 					this.emitErrorEvent(
 						"Failed to start ProxyWorker or InspectorProxyWorker",
 						error
@@ -186,11 +243,20 @@ export class ProxyController extends EventEmitter {
 		}
 	}
 
-	async reconnectInspectorProxyWorker(): Promise<WebSocket | undefined> {
-		if (this._torndown) return;
+	private async reconnectInspectorProxyWorker(): Promise<
+		WebSocket | undefined
+	> {
+		if (this._torndown) {
+			return;
+		}
+
+		assert(
+			this.latestConfig?.dev.inspector !== false,
+			"Trying to reconnect with inspector proxy worker when inspector is disabled"
+		);
 
 		const existingWebSocket = await this.inspectorProxyWorkerWebSocket?.promise;
-		if (existingWebSocket?.readyState === WebSocket.READY_STATE_OPEN) {
+		if (existingWebSocket?.readyState === WebSocket.OPEN) {
 			return existingWebSocket;
 		}
 
@@ -200,17 +266,20 @@ export class ProxyController extends EventEmitter {
 
 		try {
 			assert(this.proxyWorker);
-			const inspectorProxyWorker = await this.proxyWorker.getWorker(
+
+			const inspectorProxyWorkerUrl = await this.proxyWorker.unsafeGetDirectURL(
 				"InspectorProxyWorker"
 			);
-			({ webSocket } = await inspectorProxyWorker.fetch(
-				"http://dummy/cdn-cgi/InspectorProxyWorker/websocket",
+			webSocket = new WebSocket(
+				`${inspectorProxyWorkerUrl.href}/cdn-cgi/InspectorProxyWorker/websocket`,
 				{
-					headers: { Authorization: this.secret, Upgrade: "websocket" },
+					headers: { Authorization: this.secret },
 				}
-			));
+			);
 		} catch (cause) {
-			if (this._torndown) return;
+			if (this._torndown) {
+				return;
+			}
 
 			const error = castErrorCause(cause);
 
@@ -233,12 +302,17 @@ export class ProxyController extends EventEmitter {
 			// don't reconnect
 		});
 		webSocket.addEventListener("error", () => {
-			if (this._torndown) return;
+			if (this._torndown) {
+				return;
+			}
 
-			void this.reconnectInspectorProxyWorker();
+			if (this.latestConfig?.dev.inspector !== false) {
+				void this.reconnectInspectorProxyWorker();
+			}
 		});
 
-		webSocket.accept();
+		await events.once(webSocket, "open");
+
 		this.inspectorProxyWorkerWebSocket?.resolve(webSocket);
 
 		return webSocket;
@@ -249,18 +323,22 @@ export class ProxyController extends EventEmitter {
 		message: ProxyWorkerIncomingRequestBody,
 		retries = 3
 	): Promise<void> {
-		if (this._torndown) return;
+		if (this._torndown) {
+			return;
+		}
 
 		// Don't do any async work here. Enqueue the message with the mutex immediately.
 
 		try {
 			await this.runtimeMessageMutex.runWith(async () => {
-				assert(this.proxyWorker, "proxyWorker should already be instantiated");
+				const { proxyWorker } = await this.ready.promise;
 
-				const ready = await this.proxyWorker.ready.catch(() => undefined);
-				if (!ready) return;
+				const ready = await proxyWorker.ready.catch(() => undefined);
+				if (!ready) {
+					return;
+				}
 
-				return this.proxyWorker.dispatchFetch(
+				return proxyWorker.dispatchFetch(
 					`http://dummy/cdn-cgi/ProxyWorker/${message.type}`,
 					{
 						headers: { Authorization: this.secret },
@@ -269,7 +347,9 @@ export class ProxyController extends EventEmitter {
 				);
 			});
 		} catch (cause) {
-			if (this._torndown) return;
+			if (this._torndown) {
+				return;
+			}
 
 			const error = castErrorCause(cause);
 
@@ -281,15 +361,20 @@ export class ProxyController extends EventEmitter {
 				`Failed to send message to ProxyWorker: ${JSON.stringify(message)}`,
 				error
 			);
-
-			throw error;
 		}
 	}
 	async sendMessageToInspectorProxyWorker(
 		message: InspectorProxyWorkerIncomingWebSocketMessage,
 		retries = 3
 	): Promise<void> {
-		if (this._torndown) return;
+		if (this._torndown) {
+			return;
+		}
+
+		assert(
+			this.latestConfig?.dev.inspector !== false,
+			"Trying to send message to inspector proxy worker when inspector is disabled"
+		);
 
 		try {
 			// returns the existing websocket, if already connected
@@ -298,7 +383,9 @@ export class ProxyController extends EventEmitter {
 
 			websocket.send(JSON.stringify(message));
 		} catch (cause) {
-			if (this._torndown) return;
+			if (this._torndown) {
+				return;
+			}
 
 			const error = castErrorCause(cause);
 
@@ -312,8 +399,6 @@ export class ProxyController extends EventEmitter {
 				)}`,
 				error
 			);
-
-			throw error;
 		}
 	}
 
@@ -336,9 +421,13 @@ export class ProxyController extends EventEmitter {
 		this.latestConfig = data.config;
 
 		void this.sendMessageToProxyWorker({ type: "pause" });
-		void this.sendMessageToInspectorProxyWorker({ type: "reloadStart" });
+		if (this.latestConfig.dev.inspector !== false) {
+			void this.sendMessageToInspectorProxyWorker({ type: "reloadStart" });
+		}
 	}
 	onReloadComplete(data: ReloadCompleteEvent) {
+		this.localServerReady.resolve();
+
 		this.latestConfig = data.config;
 		this.latestBundle = data.bundle;
 
@@ -347,10 +436,12 @@ export class ProxyController extends EventEmitter {
 			proxyData: data.proxyData,
 		});
 
-		void this.sendMessageToInspectorProxyWorker({
-			type: "reloadComplete",
-			proxyData: data.proxyData,
-		});
+		if (this.latestConfig.dev.inspector !== false) {
+			void this.sendMessageToInspectorProxyWorker({
+				type: "reloadComplete",
+				proxyData: data.proxyData,
+			});
+		}
 	}
 	onProxyWorkerMessage(message: ProxyWorkerOutgoingRequestBody) {
 		switch (message.type) {
@@ -373,16 +464,25 @@ export class ProxyController extends EventEmitter {
 	onInspectorProxyWorkerMessage(
 		message: InspectorProxyWorkerOutgoingWebsocketMessage
 	) {
+		assert(
+			this.latestConfig?.dev.inspector !== false,
+			"Trying to handle inspector message when inspector is disabled"
+		);
+
 		switch (message.method) {
 			case "Runtime.consoleAPICalled": {
-				if (this._torndown) return;
+				if (this._torndown) {
+					return;
+				}
 
 				logConsoleMessage(message.params);
 
 				break;
 			}
 			case "Runtime.exceptionThrown": {
-				if (this._torndown) return;
+				if (this._torndown) {
+					return;
+				}
 
 				const stack = getSourceMappedStack(message.params.exceptionDetails);
 				logger.error(message.params.exceptionDetails.text, stack);
@@ -396,6 +496,11 @@ export class ProxyController extends EventEmitter {
 	async onInspectorProxyWorkerRequest(
 		message: InspectorProxyWorkerOutgoingRequestBody
 	) {
+		assert(
+			this.latestConfig?.dev.inspector !== false,
+			"Trying to handle inspector request when inspector is disabled"
+		);
+
 		switch (message.type) {
 			case "runtime-websocket-error":
 				// TODO: consider sending proxyData again to trigger the InspectorProxyWorker to reconnect to the runtime
@@ -410,7 +515,9 @@ export class ProxyController extends EventEmitter {
 
 				break;
 			case "debug-log":
-				if (this._torndown) break;
+				if (this._torndown) {
+					break;
+				}
 
 				logger.debug("[InspectorProxyWorker]", ...message.args);
 
@@ -444,7 +551,7 @@ export class ProxyController extends EventEmitter {
 
 	_torndown = false;
 	async teardown() {
-		logger.debug("ProxyController teardown");
+		logger.debug("ProxyController teardown beginning...");
 		this._torndown = true;
 
 		const { proxyWorker } = this;
@@ -458,16 +565,24 @@ export class ProxyController extends EventEmitter {
 					/* ignore */
 				}),
 		]);
+
+		logger.debug("ProxyController teardown complete");
 	}
 
 	// *********************
 	//   Event Dispatchers
 	// *********************
 
-	emitReadyEvent(proxyWorker: Miniflare) {
+	emitReadyEvent(
+		proxyWorker: Miniflare,
+		url: URL,
+		inspectorUrl: URL | undefined
+	) {
 		const data: ReadyEvent = {
 			type: "ready",
 			proxyWorker,
+			url,
+			inspectorUrl,
 		};
 
 		this.emit("ready", data);
@@ -479,42 +594,46 @@ export class ProxyController extends EventEmitter {
 			proxyData,
 		});
 	}
-	emitErrorEvent(reason: string, cause: Error | SerializedError) {
-		const event: ErrorEvent = {
-			type: "error",
-			source: "ProxyController",
-			cause,
-			reason,
-			data: {
-				config: this.latestConfig,
-				bundle: this.latestBundle,
-			},
-		};
 
-		this.emit("error", event);
+	emitErrorEvent(data: ErrorEvent): void;
+	emitErrorEvent(reason: string, cause?: Error | SerializedError): void;
+	emitErrorEvent(data: string | ErrorEvent, cause?: Error | SerializedError) {
+		if (typeof data === "string") {
+			data = {
+				type: "error",
+				source: "ProxyController",
+				cause: castErrorCause(cause),
+				reason: data,
+				data: {
+					config: this.latestConfig,
+					bundle: this.latestBundle,
+				},
+			};
+		}
+		super.emitErrorEvent(data);
 	}
-
-	// *********************
-	//   Event Subscribers
-	// *********************
-
-	on(event: "ready", listener: (_: ReadyEvent) => void): this;
-	on(
-		event: "previewTokenExpired",
-		listener: (_: PreviewTokenExpiredEvent) => void
-	): this;
-	// @ts-expect-error Missing overload implementation (only need the signature types, base implementation is fine)
-	on(event: "error", listener: (_: ErrorEvent) => void): this;
-	// @ts-expect-error Missing initialisation (only need the signature types, base implementation is fine)
-	once: typeof this.on;
 }
 
-export class ProxyControllerLogger extends WranglerLog {
+class ProxyControllerLogger extends WranglerLog {
+	constructor(
+		level: LogLevel,
+		opts: LogOptions,
+		private localServerReady: Promise<void>
+	) {
+		super(level, opts);
+	}
+
+	logReady(message: string): void {
+		this.localServerReady.then(() => super.logReady(message)).catch(() => {});
+	}
+
 	log(message: string) {
 		// filter out request logs being handled by the ProxyWorker
 		// the requests log remaining are handled by the UserWorker
 		// keep the ProxyWorker request logs if we're in debug mode
-		if (message.includes("/cdn-cgi/") && this.level < LogLevel.DEBUG) return;
+		if (message.includes("/cdn-cgi/") && this.level < LogLevel.DEBUG) {
+			return;
+		}
 		super.log(message);
 	}
 }
@@ -528,7 +647,9 @@ function didMiniflareOptionsChange(
 	prev: MiniflareOptions | undefined,
 	next: MiniflareOptions
 ) {
-	if (prev === undefined) return false; // first time, so 'no change'
+	if (prev === undefined) {
+		return false;
+	} // first time, so 'no change'
 
 	// otherwise, if they're not deeply equal, they've changed
 	return !deepEquality(prev, next);

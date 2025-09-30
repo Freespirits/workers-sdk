@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAccessibleHosts } from "miniflare";
+import { getEnvironmentVariableFactory } from "./environment-variables/factory";
 import { UserError } from "./errors";
 import { getGlobalWranglerConfigPath } from "./global-wrangler-config-path";
 import { logger } from "./logger";
@@ -11,15 +12,20 @@ import type { Attributes, Options } from "selfsigned";
 // Thanks @mrbbot.
 const CERT_EXPIRY_DAYS = 30;
 const ONE_DAY_IN_MS = 86400000;
-
+const getHttpsKeyPathFromEnv = getEnvironmentVariableFactory({
+	variableName: "WRANGLER_HTTPS_KEY_PATH",
+});
+const getHttpsCertPathFromEnv = getEnvironmentVariableFactory({
+	variableName: "WRANGLER_HTTPS_CERT_PATH",
+});
 /**
  * Get the options (i.e. SSL certificates) for running an HTTPS server.
  *
  * The certificates are self-signed and generated locally, and cached in the `CERT_ROOT` directory.
  */
 export function getHttpsOptions(
-	customHttpsKeyPath?: string,
-	customHttpsCertPath?: string
+	customHttpsKeyPath = getHttpsKeyPathFromEnv(),
+	customHttpsCertPath = getHttpsCertPathFromEnv()
 ) {
 	if (customHttpsKeyPath !== undefined || customHttpsCertPath !== undefined) {
 		if (customHttpsKeyPath === undefined || customHttpsCertPath === undefined) {
@@ -37,9 +43,7 @@ export function getHttpsOptions(
 				"Missing Custom Certificate File at " + customHttpsCertPath
 			);
 		}
-		if (hasCertificateExpired(customHttpsKeyPath, customHttpsCertPath)) {
-			throw new UserError("Custom Certificate is invalid");
-		}
+
 		logger.log("Using custom certificate at ", customHttpsKeyPath);
 
 		return {
@@ -101,7 +105,7 @@ function generateCertificate() {
 	// To reduce startup time, only load this dynamically when needed.
 	// eslint-disable-next-line @typescript-eslint/consistent-type-imports
 	const generate: typeof import("selfsigned").generate =
-		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		// eslint-disable-next-line @typescript-eslint/no-require-imports
 		require("selfsigned").generate;
 
 	const certAttrs: Attributes = [{ name: "commonName", value: "localhost" }];

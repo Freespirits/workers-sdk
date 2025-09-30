@@ -5,7 +5,7 @@
 // So the syntax is space-separated: keytype, base64-encoded key, comment
 
 import { exit } from "process";
-import { crash } from "@cloudflare/cli";
+import { UserError } from "../../errors";
 import { logger } from "../../logger";
 
 export function validateSSHKey(line: string) {
@@ -50,9 +50,10 @@ export function validatePublicSSHKeyCLI(
 	{ json }: { json: boolean }
 ) {
 	const bail = (reason: string) => {
-		if (!json) crash(reason);
-		else {
-			logger.log(JSON.stringify({ error: reason }, null, 4));
+		if (!json) {
+			throw new UserError(reason);
+		} else {
+			logger.json({ error: reason });
 			exit(1);
 		}
 	};

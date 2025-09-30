@@ -1,103 +1,156 @@
-name: E2E tests
+name: E2E
 
 on:
-  push:
-    branches:
-      - changeset-release/main
+  merge_group:
   pull_request:
-    types: [synchronize, opened, reopened, labeled, unlabeled]
-  repository_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  e2e-test:
+  e2e-wrangler-test:
+    name: ${{ format('Wrangler ({0})', matrix.description) }}
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}-${{ matrix.node }}
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}-${{ matrix.node }}-wrangler
       cancel-in-progress: true
-    timeout-minutes: 15
-    if: github.repository_owner == 'cloudflare' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && contains(github.event.*.labels.*.name, 'e2e' )))
-    name: "E2E Test"
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-13, windows-2022, ubuntu-22.04]
-        node: ["18"]
+        include:
+          - os: macos-13
+            description: v20, macOS
+            node: 20.19.1
+          - os: windows-2022
+            description: v20, Windows
+            node: 20.19.1
+            # we need to use an amd image to run the containers tests, since we build for linux/amd64
+          - os: ubuntu-24.04
+            description: v20, Linux
+            node: 20.19.1
+
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: pnpm/action-setup@v2
+
+      - uses: dorny/paths-filter@v3
+        id: changes
         with:
-          version: 8.8.0
-      - name: Use Node.js ${{ matrix.node }}
-        uses: actions/setup-node@v3
+          filters: |
+            everything_but_markdown:
+              - '!**/*.md'
+
+      - name: Install Dependencies
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        uses: ./.github/actions/install-dependencies
         with:
           node-version: ${{ matrix.node }}
-          cache: "pnpm"
+          turbo-api: ${{ secrets.TURBO_API }}
+          turbo-team: ${{ secrets.TURBO_TEAM }}
+          turbo-token: ${{ secrets.TURBO_TOKEN }}
+          turbo-signature: ${{ secrets.TURBO_REMOTE_CACHE_SIGNATURE_KEY }}
 
-      - name: Install workerd Dependencies
-        if: ${{ runner.os == 'Linux' }}
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update
-          sudo apt-get install -y libc++1
-
-      - name: Install NPM Dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Run builds
-        run: pnpm run build
+      - name: Bump package versions
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        run: node .github/changeset-version.js
         env:
-          NODE_ENV: "production"
-          CI_OS: ${{ runner.os }}
+          GITHUB_TOKEN: ${{ github.token }}
 
-      - name: Pack Miniflare
-        run: pnpm pack --pack-destination $HOME
-        env:
-          NODE_ENV: "production"
-        working-directory: packages/miniflare
-
-      - name: Modify wrangler package.json miniflare dependency
-        run: pnpm add $(ls $HOME/miniflare-*.tgz)
-        working-directory: packages/wrangler
-
-      - name: Pack Wrangler
-        run: pnpm pack --pack-destination $HOME
-        env:
-          NODE_ENV: "production"
-        working-directory: packages/wrangler
-
-      - name: Find Wrangler
-        shell: bash
-        id: "find-wrangler"
-        run: echo "dir=$(ls $HOME/wrangler-*.tgz)" >> $GITHUB_OUTPUT;
-
-      - name: Run tests (unix)
-        if: matrix.os == 'macos-13' || matrix.os == 'ubuntu-22.04'
-        run: |
-          pnpm add ${{ steps.find-wrangler.outputs.dir}} --global
-          pnpm run --filter wrangler test:e2e
+      - name: Run Wrangler E2E tests
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        run: pnpm run test:e2e:wrangler
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.TEST_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.TEST_CLOUDFLARE_ACCOUNT_ID }}
-          WRANGLER: wrangler
+          HYPERDRIVE_DATABASE_URL: ${{ secrets.TEST_HYPERDRIVE_DATABASE_URL}}
           NODE_OPTIONS: "--max_old_space_size=8192"
           WRANGLER_LOG_PATH: ${{ runner.temp }}/wrangler-debug-logs/
+          TEST_REPORT_PATH: ${{ runner.temp }}/test-report/index.html
+          CI_OS: ${{ matrix.os }}
 
-      - name: Run tests (windows)
-        if: matrix.os == 'windows-2022'
-        run: pnpm run --filter wrangler test:e2e
+      - name: Run getPlatformProxy() remote-bindings e2e tests
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        run: pnpm run test:e2e -F @fixture/get-platform-proxy-remote-bindings
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.TEST_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.TEST_CLOUDFLARE_ACCOUNT_ID }}
-          WRANGLER: pnpm --silent --package ${{ steps.find-wrangler.outputs.dir}} dlx wrangler
+          TEST_CLOUDFLARE_API_TOKEN: ${{ secrets.TEST_CLOUDFLARE_API_TOKEN }}
+          TEST_CLOUDFLARE_ACCOUNT_ID: ${{ secrets.TEST_CLOUDFLARE_ACCOUNT_ID }}
           NODE_OPTIONS: "--max_old_space_size=8192"
-          WRANGLER_LOG_PATH: ${{ runner.temp }}/wrangler-debug-logs/
+          CI_OS: ${{ matrix.os }}
 
-      - name: Upload debug logs
+      - name: Upload turbo logs
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: e2e-test-debug-logs-${{ matrix.os }}-${{ matrix.node }}
-          path: ${{ runner.temp }}/wrangler-debug-logs/
+          name: turbo-runs-${{ matrix.os }}-${{ matrix.node }}
+          path: .turbo/runs
+
+  e2e-vite-test:
+    name: ${{ format('Vite ({0})', matrix.description) }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}-${{ matrix.node }}-vite
+      cancel-in-progress: true
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            description: v20, macOS
+            node: 20.19.1
+          - os: windows-2022
+            description: v20, Windows
+            node: 20.19.1
+            # we need to use an amd image to run the containers tests, since we build for linux/amd64
+          - os: ubuntu-24.04
+            description: v20, Linux
+            node: 20.19.1
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            everything_but_markdown:
+              - '!**/*.md'
+
+      - name: Install Dependencies
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        uses: ./.github/actions/install-dependencies
+        with:
+          node-version: ${{ matrix.node }}
+          turbo-api: ${{ secrets.TURBO_API }}
+          turbo-team: ${{ secrets.TURBO_TEAM }}
+          turbo-token: ${{ secrets.TURBO_TOKEN }}
+          turbo-signature: ${{ secrets.TURBO_REMOTE_CACHE_SIGNATURE_KEY }}
+
+      - name: Bump package versions
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        run: node .github/changeset-version.js
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Run Vite E2E tests
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        run: pnpm test:e2e -F @cloudflare/vite-plugin --log-order=stream
+        timeout-minutes: 15
+        env:
+          NODE_DEBUG: "vite-plugin:test"
+          # The remote-binding tests need to connect to Cloudflare
+          CLOUDFLARE_API_TOKEN: ${{ secrets.TEST_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.TEST_CLOUDFLARE_ACCOUNT_ID }}
+          NODE_OPTIONS: "--max_old_space_size=8192"
+          CI_OS: ${{ matrix.os }}
+
+      - name: Upload turbo logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turbo-runs-${{ matrix.os }}-${{ matrix.node }}
+          path: .turbo/runs

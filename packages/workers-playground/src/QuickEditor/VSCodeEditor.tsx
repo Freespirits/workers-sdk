@@ -1,17 +1,15 @@
 import { Loading } from "@cloudflare/component-loading";
 import { Div } from "@cloudflare/elements";
 import { isDarkMode } from "@cloudflare/style-const";
+import { Channel, DragContext, Frame } from "@cloudflare/workers-editor-shared";
 import { useContext, useEffect, useRef, useState } from "react";
-import Frame from "./Frame";
-import {
-	Channel,
+import type { TypedModule } from "./useDraftWorker";
+import type {
 	FromQuickEditMessage,
 	ToQuickEditMessage,
 	WorkerLoadedMessage,
 	WrappedChannel,
-} from "./ipc";
-import { DragContext } from "./SplitPane";
-import { TypedModule } from "./useDraftWorker";
+} from "@cloudflare/workers-editor-shared";
 
 function stripSlashPrefix(path: string) {
 	return path[0] === "/" ? path.slice(1) : path;
@@ -90,7 +88,7 @@ export function VSCodeEditor({ content, onChange }: Props) {
 	}, []);
 
 	useEffect(() => {
-		if (quickEdit !== null)
+		if (quickEdit !== null) {
 			quickEdit.onMessage((data) => {
 				if (!content?.name) {
 					return;
@@ -137,6 +135,7 @@ export function VSCodeEditor({ content, onChange }: Props) {
 					});
 				}
 			});
+		}
 	}, [content, onChange, quickEdit]);
 
 	useEffect(() => {

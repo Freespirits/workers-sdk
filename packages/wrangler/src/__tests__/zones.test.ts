@@ -1,23 +1,37 @@
-import { rest } from "msw";
+import { http, HttpResponse } from "msw";
+import { COMPLIANCE_REGION_CONFIG_UNKNOWN } from "../environment-variables/misc-variables";
 import { getHostFromUrl, getZoneForRoute } from "../zones";
 import { mockAccountId, mockApiToken } from "./helpers/mock-account-id";
 import { msw } from "./helpers/msw";
 
-function mockGetZones(domain: string, zones: { id: string }[] = []) {
+function mockGetZones(
+	domain: string,
+	zones: { id: string }[] = [],
+	accountId = "some-account-id"
+) {
 	msw.use(
-		rest.get("*/zones", (req, res, ctx) => {
-			expect([...req.url.searchParams.entries()]).toEqual([["name", domain]]);
+		http.get(
+			"*/zones",
+			({ request }) => {
+				const url = new URL(request.url);
 
-			return res.once(
-				ctx.status(200),
-				ctx.json({
-					success: true,
-					errors: [],
-					messages: [],
-					result: zones,
-				})
-			);
-		})
+				expect([...url.searchParams.entries()]).toEqual([
+					["name", domain],
+					["account.id", accountId],
+				]);
+
+				return HttpResponse.json(
+					{
+						success: true,
+						errors: [],
+						messages: [],
+						result: zones,
+					},
+					{ status: 200 }
+				);
+			},
+			{ once: true }
+		)
 	);
 }
 
@@ -61,7 +75,12 @@ describe("Zones", () => {
 	describe("getZoneForRoute", () => {
 		test("string route", async () => {
 			mockGetZones("example.com", [{ id: "example-id" }]);
-			expect(await getZoneForRoute("example.com/*")).toEqual({
+			expect(
+				await getZoneForRoute(COMPLIANCE_REGION_CONFIG_UNKNOWN, {
+					route: "example.com/*",
+					accountId: "some-account-id",
+				})
+			).toEqual({
 				host: "example.com",
 				id: "example-id",
 			});
@@ -69,18 +88,25 @@ describe("Zones", () => {
 
 		test("string route (not a zone)", async () => {
 			mockGetZones("wrong.com", []);
-			await expect(getZoneForRoute("wrong.com/*")).rejects
-				.toMatchInlineSnapshot(`
-			[Error: Could not find zone for \`wrong.com\`. Make sure the domain is set up to be proxied by Cloudflare.
-			For more details, refer to https://developers.cloudflare.com/workers/configuration/routing/routes/#set-up-a-route]
-		`);
+			await expect(
+				getZoneForRoute(COMPLIANCE_REGION_CONFIG_UNKNOWN, {
+					route: "wrong.com/*",
+					accountId: "some-account-id",
+				})
+			).rejects.toMatchInlineSnapshot(`
+				[Error: Could not find zone for \`wrong.com\`. Make sure the domain is set up to be proxied by Cloudflare.
+				For more details, refer to https://developers.cloudflare.com/workers/configuration/routing/routes/#set-up-a-route]
+			`);
 		});
 		test("zone_id route", async () => {
 			// example-id and other-id intentionally different to show that the API is not called
 			// when a zone_id is provided in the route
 			mockGetZones("example.com", [{ id: "example-id" }]);
 			expect(
-				await getZoneForRoute({ pattern: "example.com/*", zone_id: "other-id" })
+				await getZoneForRoute(COMPLIANCE_REGION_CONFIG_UNKNOWN, {
+					route: { pattern: "example.com/*", zone_id: "other-id" },
+					accountId: "some-account-id",
+				})
 			).toEqual({
 				host: "example.com",
 				id: "other-id",
@@ -91,9 +117,12 @@ describe("Zones", () => {
 			// when a zone_id is provided in the route
 			mockGetZones("example.com", [{ id: "example-id" }]);
 			expect(
-				await getZoneForRoute({
-					pattern: "some.third-party.com/*",
-					zone_id: "other-id",
+				await getZoneForRoute(COMPLIANCE_REGION_CONFIG_UNKNOWN, {
+					route: {
+						pattern: "some.third-party.com/*",
+						zone_id: "other-id",
+					},
+					accountId: "some-account-id",
 				})
 			).toEqual({
 				host: "some.third-party.com",
@@ -104,9 +133,12 @@ describe("Zones", () => {
 		test("zone_name route (apex)", async () => {
 			mockGetZones("example.com", [{ id: "example-id" }]);
 			expect(
-				await getZoneForRoute({
-					pattern: "example.com/*",
-					zone_name: "example.com",
+				await getZoneForRoute(COMPLIANCE_REGION_CONFIG_UNKNOWN, {
+					route: {
+						pattern: "example.com/*",
+						zone_name: "example.com",
+					},
+					accountId: "some-account-id",
 				})
 			).toEqual({
 				host: "example.com",
@@ -116,9 +148,12 @@ describe("Zones", () => {
 		test("zone_name route (subdomain)", async () => {
 			mockGetZones("example.com", [{ id: "example-id" }]);
 			expect(
-				await getZoneForRoute({
-					pattern: "subdomain.example.com/*",
-					zone_name: "example.com",
+				await getZoneForRoute(COMPLIANCE_REGION_CONFIG_UNKNOWN, {
+					route: {
+						pattern: "subdomain.example.com/*",
+						zone_name: "example.com",
+					},
+					accountId: "some-account-id",
 				})
 			).toEqual({
 				host: "subdomain.example.com",
@@ -128,12 +163,58 @@ describe("Zones", () => {
 		test("zone_name route (custom hostname)", async () => {
 			mockGetZones("example.com", [{ id: "example-id" }]);
 			expect(
-				await getZoneForRoute({
-					pattern: "some.third-party.com/*",
-					zone_name: "example.com",
+				await getZoneForRoute(COMPLIANCE_REGION_CONFIG_UNKNOWN, {
+					route: {
+						pattern: "some.third-party.com/*",
+						zone_name: "example.com",
+					},
+					accountId: "some-account-id",
 				})
 			).toEqual({
 				host: "some.third-party.com",
+				id: "example-id",
+			});
+		});
+		test("zone_name route (subdomain, subsequent fetches are cached)", async () => {
+			mockGetZones("example.com", [{ id: "example-id" }]);
+			const zoneIdCache = new Map();
+			expect(
+				await getZoneForRoute(
+					COMPLIANCE_REGION_CONFIG_UNKNOWN,
+					{
+						route: {
+							pattern: "subdomain.example.com/*",
+							zone_name: "example.com",
+						},
+						accountId: "some-account-id",
+					},
+					zoneIdCache
+				)
+			).toEqual({
+				host: "subdomain.example.com",
+				id: "example-id",
+			});
+
+			expect(await zoneIdCache.get("some-account-id:example.com")).toEqual(
+				"example-id"
+			);
+
+			// This will fail if we don't cache the response
+			// due to a "mock not found" error
+			expect(
+				await getZoneForRoute(
+					COMPLIANCE_REGION_CONFIG_UNKNOWN,
+					{
+						route: {
+							pattern: "subdomain.example.com/*",
+							zone_name: "example.com",
+						},
+						accountId: "some-account-id",
+					},
+					zoneIdCache
+				)
+			).toEqual({
+				host: "subdomain.example.com",
 				id: "example-id",
 			});
 		});

@@ -1,4 +1,7 @@
 {
-	"name": "wasm-app",
-	"private": true
+	"name": "@fixture/wasm-basic",
+	"private": true,
+	"volta": {
+		"extends": "../../package.json"
+	}
 }

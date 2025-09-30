@@ -1,14 +1,42 @@
 import { z } from "zod";
 import { ValueOf } from "../workers";
+import { AI_PLUGIN, AI_PLUGIN_NAME } from "./ai";
+import {
+	ANALYTICS_ENGINE_PLUGIN,
+	ANALYTICS_ENGINE_PLUGIN_NAME,
+} from "./analytics-engine";
+import { ASSETS_PLUGIN } from "./assets";
+import { ASSETS_PLUGIN_NAME } from "./assets/constants";
+import {
+	BROWSER_RENDERING_PLUGIN,
+	BROWSER_RENDERING_PLUGIN_NAME,
+} from "./browser-rendering";
 import { CACHE_PLUGIN, CACHE_PLUGIN_NAME } from "./cache";
 import { CORE_PLUGIN, CORE_PLUGIN_NAME } from "./core";
 import { D1_PLUGIN, D1_PLUGIN_NAME } from "./d1";
+import {
+	DISPATCH_NAMESPACE_PLUGIN,
+	DISPATCH_NAMESPACE_PLUGIN_NAME,
+} from "./dispatch-namespace";
 import { DURABLE_OBJECTS_PLUGIN, DURABLE_OBJECTS_PLUGIN_NAME } from "./do";
+import { EMAIL_PLUGIN, EMAIL_PLUGIN_NAME } from "./email";
+import { HELLO_WORLD_PLUGIN, HELLO_WORLD_PLUGIN_NAME } from "./hello-world";
 import { HYPERDRIVE_PLUGIN, HYPERDRIVE_PLUGIN_NAME } from "./hyperdrive";
+import { IMAGES_PLUGIN, IMAGES_PLUGIN_NAME } from "./images";
 import { KV_PLUGIN, KV_PLUGIN_NAME } from "./kv";
+import { MTLS_PLUGIN, MTLS_PLUGIN_NAME } from "./mtls";
+import { PIPELINE_PLUGIN, PIPELINES_PLUGIN_NAME } from "./pipelines";
 import { QUEUES_PLUGIN, QUEUES_PLUGIN_NAME } from "./queues";
 import { R2_PLUGIN, R2_PLUGIN_NAME } from "./r2";
 import { RATELIMIT_PLUGIN, RATELIMIT_PLUGIN_NAME } from "./ratelimit";
+import { SECRET_STORE_PLUGIN, SECRET_STORE_PLUGIN_NAME } from "./secret-store";
+import { VECTORIZE_PLUGIN, VECTORIZE_PLUGIN_NAME } from "./vectorize";
+import { VPC_SERVICES_PLUGIN, VPC_SERVICES_PLUGIN_NAME } from "./vpc-services";
+import {
+	WORKER_LOADER_PLUGIN,
+	WORKER_LOADER_PLUGIN_NAME,
+} from "./worker-loader";
+import { WORKFLOWS_PLUGIN, WORKFLOWS_PLUGIN_NAME } from "./workflows";
 
 export const PLUGINS = {
 	[CORE_PLUGIN_NAME]: CORE_PLUGIN,
@@ -20,6 +48,21 @@ export const PLUGINS = {
 	[R2_PLUGIN_NAME]: R2_PLUGIN,
 	[HYPERDRIVE_PLUGIN_NAME]: HYPERDRIVE_PLUGIN,
 	[RATELIMIT_PLUGIN_NAME]: RATELIMIT_PLUGIN,
+	[ASSETS_PLUGIN_NAME]: ASSETS_PLUGIN,
+	[WORKFLOWS_PLUGIN_NAME]: WORKFLOWS_PLUGIN,
+	[PIPELINES_PLUGIN_NAME]: PIPELINE_PLUGIN,
+	[SECRET_STORE_PLUGIN_NAME]: SECRET_STORE_PLUGIN,
+	[EMAIL_PLUGIN_NAME]: EMAIL_PLUGIN,
+	[ANALYTICS_ENGINE_PLUGIN_NAME]: ANALYTICS_ENGINE_PLUGIN,
+	[AI_PLUGIN_NAME]: AI_PLUGIN,
+	[BROWSER_RENDERING_PLUGIN_NAME]: BROWSER_RENDERING_PLUGIN,
+	[DISPATCH_NAMESPACE_PLUGIN_NAME]: DISPATCH_NAMESPACE_PLUGIN,
+	[IMAGES_PLUGIN_NAME]: IMAGES_PLUGIN,
+	[VECTORIZE_PLUGIN_NAME]: VECTORIZE_PLUGIN,
+	[VPC_SERVICES_PLUGIN_NAME]: VPC_SERVICES_PLUGIN,
+	[MTLS_PLUGIN_NAME]: MTLS_PLUGIN,
+	[HELLO_WORLD_PLUGIN_NAME]: HELLO_WORLD_PLUGIN,
+	[WORKER_LOADER_PLUGIN_NAME]: WORKER_LOADER_PLUGIN,
 };
 export type Plugins = typeof PLUGINS;
 
@@ -66,13 +109,33 @@ export type WorkerOptions = z.input<typeof CORE_PLUGIN.options> &
 	z.input<typeof QUEUES_PLUGIN.options> &
 	z.input<typeof R2_PLUGIN.options> &
 	z.input<typeof HYPERDRIVE_PLUGIN.options> &
-	z.input<typeof RATELIMIT_PLUGIN.options>;
+	z.input<typeof RATELIMIT_PLUGIN.options> &
+	z.input<typeof EMAIL_PLUGIN.options> &
+	z.input<typeof ASSETS_PLUGIN.options> &
+	z.input<typeof WORKFLOWS_PLUGIN.options> &
+	z.input<typeof PIPELINE_PLUGIN.options> &
+	z.input<typeof SECRET_STORE_PLUGIN.options> &
+	z.input<typeof ANALYTICS_ENGINE_PLUGIN.options> &
+	z.input<typeof AI_PLUGIN.options> &
+	z.input<typeof BROWSER_RENDERING_PLUGIN.options> &
+	z.input<typeof DISPATCH_NAMESPACE_PLUGIN.options> &
+	z.input<typeof IMAGES_PLUGIN.options> &
+	z.input<typeof VECTORIZE_PLUGIN.options> &
+	z.input<typeof VPC_SERVICES_PLUGIN.options> &
+	z.input<typeof MTLS_PLUGIN.options> &
+	z.input<typeof HELLO_WORLD_PLUGIN.options> &
+	z.input<typeof WORKER_LOADER_PLUGIN.options>;
+
 export type SharedOptions = z.input<typeof CORE_PLUGIN.sharedOptions> &
 	z.input<typeof CACHE_PLUGIN.sharedOptions> &
 	z.input<typeof D1_PLUGIN.sharedOptions> &
 	z.input<typeof DURABLE_OBJECTS_PLUGIN.sharedOptions> &
 	z.input<typeof KV_PLUGIN.sharedOptions> &
-	z.input<typeof R2_PLUGIN.sharedOptions>;
+	z.input<typeof R2_PLUGIN.sharedOptions> &
+	z.input<typeof WORKFLOWS_PLUGIN.sharedOptions> &
+	z.input<typeof SECRET_STORE_PLUGIN.sharedOptions> &
+	z.input<typeof ANALYTICS_ENGINE_PLUGIN.sharedOptions> &
+	z.input<typeof HELLO_WORLD_PLUGIN.sharedOptions>;
 
 export const PLUGIN_ENTRIES = Object.entries(PLUGINS) as [
 	keyof Plugins,
@@ -99,6 +162,7 @@ export {
 	ProxyClient,
 	getFreshSourceMapSupport,
 	kCurrentWorker,
+	getNodeCompat,
 } from "./core";
 export type {
 	CompiledModuleRule,
@@ -107,6 +171,7 @@ export type {
 	ModuleDefinition,
 	GlobalServicesOptions,
 	SourceOptions,
+	NodeJSCompatMode,
 } from "./core";
 export type * from "./core/proxy/types";
 export * from "./d1";
@@ -116,3 +181,19 @@ export * from "./queues";
 export * from "./r2";
 export * from "./hyperdrive";
 export * from "./ratelimit";
+export * from "./assets";
+export * from "./assets/schema";
+export * from "./workflows";
+export * from "./pipelines";
+export * from "./secret-store";
+export * from "./email";
+export * from "./analytics-engine";
+export * from "./ai";
+export * from "./browser-rendering";
+export * from "./dispatch-namespace";
+export * from "./images";
+export * from "./vectorize";
+export * from "./vpc-services";
+export * from "./mtls";
+export * from "./hello-world";
+export * from "./worker-loader";

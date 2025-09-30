@@ -1,24 +1,34 @@
 import { exit } from "process";
-import { cancel, crash, endSection, log } from "@cloudflare/cli";
+import { cancel, endSection, log, newline } from "@cloudflare/cli";
 import { processArgument } from "@cloudflare/cli/args";
 import { brandColor, dim, yellow } from "@cloudflare/cli/colors";
 import { spinner } from "@cloudflare/cli/interactive";
-import { DeploymentsService } from "../client";
+import { DeploymentsService } from "@cloudflare/containers-shared";
+import { UserError } from "../../errors";
 import { wrap } from "../helpers/wrap";
 import { idToLocationName } from "../locations";
 import { statusToColored } from "./util";
-import type { Placement, State } from "../client";
-import type { DeploymentV2 } from "../client/models/DeploymentV2";
-import type { Status } from "../enums";
+import type {
+	DeploymentPlacementState,
+	DeploymentV2,
+	Placement,
+	PlacementStatusHealth,
+} from "@cloudflare/containers-shared";
 
 function ipv6(placement: Placement | undefined) {
-	if (!placement) return yellow("no ipv6 yet");
-	if (!placement.status["ipv6Address"]) return yellow("no ipv6 yet");
+	if (!placement) {
+		return yellow("no ipv6 yet");
+	}
+	if (!placement.status["ipv6Address"]) {
+		return yellow("no ipv6 yet");
+	}
 	return placement.status["ipv6Address"];
 }
 
 function uptime(placement?: Placement) {
-	if (!placement) return yellow("inactive");
+	if (!placement) {
+		return yellow("inactive");
+	}
 	const ms = Date.now() - new Date(placement.created_at).getTime();
 	const days = Math.floor(ms / 86400000);
 	const hours = new Date(ms).getUTCHours();
@@ -45,9 +55,15 @@ function version(deployment: DeploymentV2) {
 }
 
 function health(placement?: Placement) {
-	if (!placement) return statusToColored("placing");
-	if (!placement.status["health"]) return statusToColored("placing");
-	return statusToColored(placement.status["health"] as Status);
+	if (!placement) {
+		return statusToColored();
+	}
+
+	if (!placement.status["health"]) {
+		return statusToColored();
+	}
+
+	return statusToColored(placement.status["health"] as PlacementStatusHealth);
 }
 
 /**
@@ -62,26 +78,28 @@ export async function loadDeployments(
 		image?: string;
 		state?: string;
 		ipv4?: string;
+		labels?: string[];
 	}
 ): Promise<DeploymentV2[]> {
 	const { start, stop } = spinner();
 	start("Loading deployments");
 	const [deploymentsResponse, err] = await wrap(
 		DeploymentsService.listDeploymentsV2(
+			undefined,
 			deploymentsParams?.location,
 			deploymentsParams?.image,
-			deploymentsParams?.state as State,
-			deploymentsParams?.state
+			deploymentsParams?.state as DeploymentPlacementState | undefined,
+			deploymentsParams?.state,
+			deploymentsParams?.labels
 		)
 	);
 
 	stop();
 	if (err) {
-		crash(
+		throw new UserError(
 			"There has been an error while loading your deployments: \n " +
 				err.message
 		);
-		return [];
 	}
 
 	const deployments = deploymentsResponse.filter((d) =>
@@ -156,11 +174,10 @@ export async function pickDeployment(deploymentIdPrefix?: string) {
 }
 
 export function logDeployment(deployment: DeploymentV2) {
+	log(`${brandColor("image")} ${dim(deployment.image)}`);
 	log(
-		`${brandColor("Image")} ${dim(deployment.image)}\n${brandColor(
-			"Location"
-		)} ${dim(idToLocationName(deployment.location.name))}\n${brandColor(
-			"Version"
-		)} ${dim(`${deployment.version}`)}\n`
+		`${brandColor("location")} ${dim(idToLocationName(deployment.location.name))}`
 	);
+	log(`${brandColor("version")} ${dim(`${deployment.version}`)}`);
+	newline();
 }

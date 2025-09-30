@@ -3,36 +3,56 @@ import {
 	endSection,
 	log,
 	startSection,
-	status,
 	updateStatus,
 } from "@cloudflare/cli";
 import { processArgument } from "@cloudflare/cli/args";
+import { brandColor, dim } from "@cloudflare/cli/colors";
 import { inputPrompt, spinner } from "@cloudflare/cli/interactive";
+import {
+	AssignIPv4,
+	AssignIPv6,
+	DeploymentsService,
+} from "@cloudflare/containers-shared";
+import { isNonInteractiveOrCI } from "../is-interactive";
+import { logger } from "../logger";
+import { parseByteSize } from "./../parse";
 import { pollSSHKeysUntilCondition, waitForPlacement } from "./cli";
 import { getLocation } from "./cli/locations";
-import { DeploymentsService } from "./client";
 import {
 	checkEverythingIsSet,
 	collectEnvironmentVariables,
-	interactWithUser,
-	loadAccountSpinner,
+	collectLabels,
+	parseImageName,
 	promptForEnvironmentVariables,
+	promptForLabels,
 	renderDeploymentConfiguration,
 	renderDeploymentMutationError,
+	resolveMemory,
 } from "./common";
 import { wrap } from "./helpers/wrap";
+import {
+	checkInstanceType,
+	promptForInstanceType,
+} from "./instance-type/instance-type";
 import { loadAccount } from "./locations";
 import { getNetworkInput } from "./network/network";
 import { sshPrompts as promptForSSHKeyAndGetAddedSSHKey } from "./ssh/ssh";
 import type { Config } from "../config";
 import type {
-	CommonYargsArgvJSON,
-	StrictYargsOptionsToInterfaceJSON,
+	CommonYargsArgv,
+	StrictYargsOptionsToInterface,
 } from "../yargs-types";
-import type { EnvironmentVariable, SSHPublicKeyID } from "./client";
 import type { Arg } from "@cloudflare/cli/interactive";
+import type {
+	CreateDeploymentV2RequestBody,
+	EnvironmentVariable,
+	Label,
+	SSHPublicKeyID,
+} from "@cloudflare/containers-shared";
 
-export function createCommandOptionalYargs(yargs: CommonYargsArgvJSON) {
+const defaultContainerImage = "docker.io/cloudflare/hello-world:1.0";
+
+export function createCommandOptionalYargs(yargs: CommonYargsArgv) {
 	return yargs
 		.option("image", {
 			requiresArg: true,
@@ -55,6 +75,13 @@ export function createCommandOptionalYargs(yargs: CommonYargsArgvJSON) {
 			describe: "Container environment variables",
 			coerce: (arg: unknown[]) => arg.map((a) => a?.toString() ?? ""),
 		})
+		.option("label", {
+			requiresArg: true,
+			type: "array",
+			demandOption: false,
+			describe: "Deployment labels",
+			coerce: (arg: unknown[]) => arg.map((a) => a?.toString() ?? ""),
+		})
 		.option("all-ssh-keys", {
 			requiresArg: false,
 			type: "boolean",
@@ -69,6 +96,12 @@ export function createCommandOptionalYargs(yargs: CommonYargsArgvJSON) {
 			demandOption: false,
 			describe: "ID of the SSH key to add to the deployment",
 		})
+		.option("instance-type", {
+			requiresArg: true,
+			choices: ["dev", "basic", "standard"] as const,
+			demandOption: false,
+			describe: "Instance type to allocate to this deployment",
+		})
 		.option("vcpu", {
 			requiresArg: true,
 			type: "number",
@@ -80,7 +113,7 @@ export function createCommandOptionalYargs(yargs: CommonYargsArgvJSON) {
 			type: "string",
 			demandOption: false,
 			describe:
-				"Amount of memory (GB, MB...) to allocate to this deployment. Ex: 4GB.",
+				"Amount of memory (GiB, MiB...) to allocate to this deployment. Ex: 4GiB.",
 		})
 		.option("ipv4", {
 			requiresArg: false,
@@ -91,38 +124,69 @@ export function createCommandOptionalYargs(yargs: CommonYargsArgvJSON) {
 }
 
 export async function createCommand(
-	args: StrictYargsOptionsToInterfaceJSON<typeof createCommandOptionalYargs>,
+	args: StrictYargsOptionsToInterface<typeof createCommandOptionalYargs>,
 	config: Config
 ) {
-	await loadAccountSpinner(args);
-
 	const environmentVariables = collectEnvironmentVariables(
 		[],
 		config,
 		args.var
 	);
-	if (!interactWithUser(args)) {
+	const labels = collectLabels(args.label);
+	if (isNonInteractiveOrCI()) {
+		if (config.cloudchamber.image != undefined && args.image == undefined) {
+			args.image = config.cloudchamber.image;
+		}
+		if (
+			config.cloudchamber.location != undefined &&
+			args.location == undefined
+		) {
+			args.location = config.cloudchamber.location;
+		}
+
 		const body = checkEverythingIsSet(args, ["image", "location"]);
+
+		const { err } = parseImageName(body.image);
+		if (err !== undefined) {
+			throw new Error(err);
+		}
+
 		const keysToAdd = args.allSshKeys
 			? (await pollSSHKeysUntilCondition(() => true)).map((key) => key.id)
 			: [];
-		const deployment = await DeploymentsService.createDeploymentV2({
+		const useIpv4 = args.ipv4 ?? config.cloudchamber.ipv4;
+		const network =
+			useIpv4 === true
+				? { assign_ipv4: AssignIPv4.PREDEFINED }
+				: { assign_ipv6: AssignIPv6.PREDEFINED };
+		const memoryMib = resolveMemory(args, config.cloudchamber);
+		const vcpu = args.vcpu ?? config.cloudchamber.vcpu;
+		const instanceType = checkInstanceType(args, config.cloudchamber);
+
+		const deploymentRequest: CreateDeploymentV2RequestBody = {
 			image: body.image,
 			location: body.location,
 			ssh_public_key_ids: keysToAdd,
 			environment_variables: environmentVariables,
-			vcpu: args.vcpu ?? config.cloudchamber.vcpu,
-			memory: args.memory ?? config.cloudchamber.memory,
-		});
-		console.log(JSON.stringify(deployment, null, 4));
+			labels: labels,
+			instance_type: instanceType,
+			network: network,
+		};
+		if (instanceType === undefined) {
+			deploymentRequest.vcpu = vcpu;
+			deploymentRequest.memory_mib = memoryMib;
+		}
+		const deployment =
+			await DeploymentsService.createDeploymentV2(deploymentRequest);
+		logger.json(deployment);
 		return;
 	}
 
-	await handleCreateCommand(args, config, environmentVariables);
+	await handleCreateCommand(args, config, environmentVariables, labels);
 }
 
 async function askWhichSSHKeysDoTheyWantToAdd(
-	args: StrictYargsOptionsToInterfaceJSON<typeof createCommandOptionalYargs>,
+	args: StrictYargsOptionsToInterface<typeof createCommandOptionalYargs>,
 	key: SSHPublicKeyID | undefined
 ): Promise<SSHPublicKeyID[]> {
 	const keyItems = await pollSSHKeysUntilCondition(() => true);
@@ -137,9 +201,9 @@ async function askWhichSSHKeysDoTheyWantToAdd(
 
 	if (keys.length === 1) {
 		const yes = await inputPrompt({
-			question: `Do you want to add the ssh key ${keyItems[0].name}?`,
+			question: `Do you want to add the SSH key ${keyItems[0].name}?`,
 			type: "confirm",
-			helpText: "You need this to ssh into the VM",
+			helpText: "You need this to SSH into the VM",
 			defaultValue: false,
 			label: "",
 		});
@@ -156,15 +220,15 @@ async function askWhichSSHKeysDoTheyWantToAdd(
 
 	const res = await inputPrompt({
 		question:
-			"You have multiple ssh keys in your account, what do you want to do for this new deployment?",
-		label: "",
+			"You have multiple SSH keys in your account, what do you want to do for this new deployment?",
+		label: "ssh",
 		defaultValue: false,
 		helpText: "",
 		type: "select",
 		options: [
 			{ label: "Add all of them", value: "all" },
 			{ label: "Select the keys", value: "select" },
-			{ label: "Don't add any ssh keys", value: "none" },
+			{ label: "Don't add any SSH keys", value: "none" },
 		],
 	});
 	if (res === "all") {
@@ -183,7 +247,9 @@ async function askWhichSSHKeysDoTheyWantToAdd(
 				value: keyOpt.id,
 			})),
 			validate: (values: Arg) => {
-				if (!Array.isArray(values)) return "unknown error";
+				if (!Array.isArray(values)) {
+					return "unknown error";
+				}
 				if (values.length === 0) {
 					return "Select atleast one ssh key!";
 				}
@@ -198,52 +264,78 @@ async function askWhichSSHKeysDoTheyWantToAdd(
 	return [];
 }
 
-export async function handleCreateCommand(
-	args: StrictYargsOptionsToInterfaceJSON<typeof createCommandOptionalYargs>,
+async function handleCreateCommand(
+	args: StrictYargsOptionsToInterface<typeof createCommandOptionalYargs>,
 	config: Config,
-	environmentVariables: EnvironmentVariable[] | undefined
+	environmentVariables: EnvironmentVariable[] | undefined,
+	labels: Label[] | undefined
 ) {
 	startSection("Create a Cloudflare container", "Step 1 of 2");
 	const sshKeyID = await promptForSSHKeyAndGetAddedSSHKey(args);
-	const image = await processArgument<string>({ image: args.image }, "image", {
+	const givenImage = args.image ?? config.cloudchamber.image;
+	const image = await processArgument<string>({ image: givenImage }, "image", {
 		question: whichImageQuestion,
 		label: "image",
 		validate: (value) => {
-			if (typeof value !== "string") return "unknown error";
-			if (value.length === 0) return "you should fill this input";
-			if (value.endsWith(":latest")) return "we don't allow :latest tags";
+			if (typeof value !== "string") {
+				return "Unknown error";
+			}
+
+			if (value.length === 0) {
+				// validate is called before defaultValue is
+				// applied, so we must set it ourselves
+				value = defaultContainerImage;
+			}
+
+			const { err } = parseImageName(value);
+			return err;
 		},
-		defaultValue: args.image ?? "",
-		initialValue: args.image ?? "",
-		helpText: ":latest tags are not allowed!",
+		defaultValue: givenImage ?? defaultContainerImage,
+		helpText: 'NAME:TAG ("latest" tag is not allowed)',
 		type: "text",
 	});
 
-	const location = await getLocation(args);
+	const location = await getLocation({
+		location: args.location ?? config.cloudchamber.location,
+	});
 	const keys = await askWhichSSHKeysDoTheyWantToAdd(args, sshKeyID);
-	const network = await getNetworkInput(args);
+	const network = await getNetworkInput({
+		ipv4: args.ipv4 ?? config.cloudchamber.ipv4,
+	});
 
 	const selectedEnvironmentVariables = await promptForEnvironmentVariables(
 		environmentVariables,
 		[],
 		false
 	);
+	const selectedLabels = await promptForLabels(labels, [], false);
 
 	const account = await loadAccount();
+
+	const memoryMib =
+		resolveMemory(args, config.cloudchamber) ??
+		account.defaults.memory_mib ??
+		Math.round(
+			parseByteSize(account.defaults.memory ?? "2000MiB", 1024) / (1024 * 1024)
+		);
+	const vcpu = args.vcpu ?? config.cloudchamber.vcpu ?? account.defaults.vcpus;
+	const instanceType = await promptForInstanceType(true);
+
 	renderDeploymentConfiguration("create", {
 		image,
 		location,
 		network,
-		vcpu: args.vcpu ?? config.cloudchamber.vcpu ?? account.defaults.vcpus,
-		memory:
-			args.memory ?? config.cloudchamber.memory ?? account.defaults.memory,
+		instanceType,
+		vcpu,
+		memoryMib,
 		environmentVariables: selectedEnvironmentVariables,
+		labels: selectedLabels,
 		env: args.env,
 	});
 
 	const yes = await inputPrompt({
 		type: "confirm",
-		question: "Do you want to go ahead and create your container?",
+		question: "Proceed?",
 		label: "",
 	});
 	if (!yes) {
@@ -252,17 +344,24 @@ export async function handleCreateCommand(
 	}
 
 	const { start, stop } = spinner();
-	start("Creating your container", "shortly your container will be created");
+	start("Creating your container", "your container will be created shortly");
+	const deploymentRequest: CreateDeploymentV2RequestBody = {
+		image,
+		location,
+		ssh_public_key_ids: keys,
+		environment_variables: environmentVariables,
+		labels,
+		instance_type: instanceType,
+		vcpu: undefined,
+		memory_mib: undefined,
+		network,
+	};
+	if (instanceType === undefined) {
+		deploymentRequest.vcpu = vcpu;
+		deploymentRequest.memory_mib = memoryMib;
+	}
 	const [deployment, err] = await wrap(
-		DeploymentsService.createDeploymentV2({
-			image,
-			location: location,
-			ssh_public_key_ids: keys,
-			environment_variables: environmentVariables,
-			vcpu: args.vcpu ?? config.cloudchamber.vcpu,
-			memory: args.memory ?? config.cloudchamber.memory,
-			network,
-		})
+		DeploymentsService.createDeploymentV2(deploymentRequest)
 	);
 	if (err) {
 		stop();
@@ -271,13 +370,12 @@ export async function handleCreateCommand(
 	}
 
 	stop();
-	updateStatus(`${status.success} Created deployment!`);
-	if (deployment.network?.ipv4)
-		log(`${deployment.id}\nIP: ${deployment.network.ipv4}`);
+	updateStatus("Created deployment", false);
+	log(`${brandColor("id")} ${dim(deployment.id)}\n`);
 
 	endSection("Creating a placement for your container");
 	startSection("Create a Cloudflare container", "Step 2 of 2");
 	await waitForPlacement(deployment);
 }
 
-const whichImageQuestion = "Which image url should we use for your container?";
+const whichImageQuestion = "Which image should we use for your container?";

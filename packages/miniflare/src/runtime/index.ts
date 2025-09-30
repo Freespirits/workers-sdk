@@ -1,14 +1,17 @@
 import assert from "assert";
-import childProcess from "child_process";
+import childProcess, { spawn } from "child_process";
+import { randomBytes } from "crypto";
 import { Abortable, once } from "events";
+import path from "path";
 import rl from "readline";
-import { Readable } from "stream";
+import { Readable, Transform } from "stream";
 import { $ as $colors, red } from "kleur/colors";
 import workerdPath, {
 	compatibilityDate as supportedCompatibilityDate,
 } from "workerd";
 import { z } from "zod";
 import { SERVICE_LOOPBACK, SOCKET_ENTRY } from "../plugins";
+import { MiniflareCoreError } from "../shared";
 import { Awaitable } from "../workers";
 
 const ControlMessageSchema = z.discriminatedUnion("event", [
@@ -83,7 +86,9 @@ function pipeOutput(stdout: Readable, stderr: Readable) {
 	// https://github.com/vadimdemedes/ink/blob/5d24ed8ada593a6c36ea5416f452158461e33ba5/readme.md#patchconsole
 	// Writing directly to `process.stdout/stderr` would result in graphical
 	// glitches.
+	// eslint-disable-next-line no-console
 	rl.createInterface(stdout).on("line", (data) => console.log(data));
+	// eslint-disable-next-line no-console
 	rl.createInterface(stderr).on("line", (data) => console.error(red(data)));
 	// stdout.pipe(process.stdout);
 	// stderr.pipe(process.stderr);
@@ -119,13 +124,89 @@ function getRuntimeArgs(options: RuntimeOptions) {
 	return args;
 }
 
+/**
+ * Copied from https://github.com/microsoft/vscode-js-debug/blob/0b5e0dade997b3c702a98e1f58989afcb30612d6/src/targets/node/bootloader/environment.ts#L129
+ *
+ * This function returns the segment of process.env.VSCODE_INSPECTOR_OPTIONS that corresponds to the current process (rather than a parent process)
+ */
+function getInspectorOptions() {
+	const value = process.env.VSCODE_INSPECTOR_OPTIONS;
+	if (!value) {
+		return undefined;
+	}
+
+	const ownOptions = value
+		.split(":::")
+		.reverse()
+		.find((v) => !!v);
+	if (!ownOptions) {
+		return;
+	}
+
+	try {
+		return JSON.parse(ownOptions);
+	} catch {
+		return undefined;
+	}
+}
+
+class StartupLogBuffer {
+	stdoutStream: Transform;
+	stderrStream: Transform;
+	stdoutBuffer: string[] = [];
+	stderrBuffer: string[] = [];
+
+	buffering = true;
+
+	constructor() {
+		this.stdoutStream = new Transform({
+			transform: (chunk, encoding, callback) => {
+				if (this.buffering) {
+					this.stdoutBuffer.push(chunk.toString());
+				}
+				callback(null, chunk);
+			},
+		});
+		this.stderrStream = new Transform({
+			transform: (chunk, encoding, callback) => {
+				if (this.buffering) {
+					this.stderrBuffer.push(chunk.toString());
+				}
+				callback(null, chunk);
+			},
+		});
+	}
+
+	stopBuffering() {
+		this.buffering = false;
+	}
+
+	handleStartupFailure() {
+		const addressInUseLog = this.stderrBuffer.find((chunk) =>
+			chunk.includes("Address already in use; toString() = ")
+		);
+		if (addressInUseLog) {
+			const match = addressInUseLog.match(
+				/Address already in use; toString\(\) = (.+):(.+)/
+			) ?? ["", "unknown", "unknown"];
+
+			throw new MiniflareCoreError(
+				"ERR_ADDRESS_IN_USE",
+				`Address already in use (${match[1]}:${match[2]}). Please check that you are not already running a server on this address or specify a different port with --port.`
+			);
+		}
+	}
+}
+
 export class Runtime {
 	#process?: childProcess.ChildProcess;
 	#processExitPromise?: Promise<void>;
 
 	async updateConfig(
 		configBuffer: Buffer,
-		options: Abortable & RuntimeOptions
+		options: Abortable & RuntimeOptions,
+		workerNames: string[],
+		abortSignal: AbortSignal
 	): Promise<SocketPorts | undefined> {
 		// 1. Stop existing process (if any) and wait for exit
 		await this.dispose();
@@ -141,11 +222,16 @@ export class Runtime {
 			stdio: ["pipe", "pipe", "pipe", "pipe"],
 			env: { ...process.env, FORCE_COLOR },
 		});
+		const startupLogBuffer = new StartupLogBuffer();
 		this.#process = runtimeProcess;
 		this.#processExitPromise = waitForExit(runtimeProcess);
 
 		const handleRuntimeStdio = options.handleRuntimeStdio ?? pipeOutput;
-		handleRuntimeStdio(runtimeProcess.stdout, runtimeProcess.stderr);
+
+		handleRuntimeStdio(
+			runtimeProcess.stdout.pipe(startupLogBuffer.stdoutStream),
+			runtimeProcess.stderr.pipe(startupLogBuffer.stderrStream)
+		);
 
 		const controlPipe = runtimeProcess.stdio[3];
 		assert(controlPipe instanceof Readable);
@@ -156,7 +242,53 @@ export class Runtime {
 		await once(runtimeProcess.stdin, "finish");
 
 		// 4. Wait for sockets to start listening
-		return waitForPorts(controlPipe, options);
+		const ports = await waitForPorts(controlPipe, options);
+		if (ports?.has(kInspectorSocket) && process.env.VSCODE_INSPECTOR_OPTIONS) {
+			// We have an inspector socket and we're in a VSCode Debug Terminal.
+			// Let's startup a watchdog service to register ourselves as a debuggable target
+
+			// First, we need to _find_ the watchdog script. It's located next to bootloader.js, which should be injected as a require hook
+			const bootloaderPath =
+				process.env.NODE_OPTIONS?.match(/--require "(.*?)"/)?.[1];
+
+			if (!bootloaderPath) {
+				return ports;
+			}
+			const watchdogPath = path.resolve(bootloaderPath, "../watchdog.js");
+
+			const info = getInspectorOptions();
+
+			for (const name of workerNames) {
+				// This is copied from https://github.com/microsoft/vscode-js-debug/blob/0b5e0dade997b3c702a98e1f58989afcb30612d6/src/targets/node/bootloader.ts#L284
+				// It spawns a detached "watchdog" process for each corresponding (user) Worker in workerd which will maintain the VSCode debug connection
+				const p = spawn(process.execPath, [watchdogPath], {
+					env: {
+						NODE_INSPECTOR_INFO: JSON.stringify({
+							ipcAddress: info.inspectorIpc || "",
+							pid: String(this.#process.pid),
+							scriptName: name,
+							inspectorURL: `ws://127.0.0.1:${ports?.get(kInspectorSocket)}/core:user:${name}`,
+							waitForDebugger: true,
+							ownId: randomBytes(12).toString("hex"),
+							openerId: info.openerId,
+						}),
+						NODE_SKIP_PLATFORM_CHECK: process.env.NODE_SKIP_PLATFORM_CHECK,
+						ELECTRON_RUN_AS_NODE: "1",
+					},
+					stdio: "ignore",
+					detached: true,
+				});
+				p.unref();
+			}
+		}
+
+		startupLogBuffer.stopBuffering();
+
+		if (ports === undefined && !abortSignal.aborted) {
+			startupLogBuffer.handleStartupFailure();
+		}
+
+		return ports;
 	}
 
 	dispose(): Awaitable<void> {

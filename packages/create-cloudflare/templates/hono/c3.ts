@@ -1,25 +1,9 @@
-import { logRaw } from "@cloudflare/cli";
-import { runFrameworkGenerator } from "frameworks/index";
-import type { TemplateConfig } from "../../src/templates";
-import type { C3Context } from "types";
+import pages from "./pages/c3";
+import workers from "./workers/c3";
+import type { MultiPlatformTemplateConfig } from "../../src/templates";
 
-const generate = async (ctx: C3Context) => {
-	await runFrameworkGenerator(ctx, [
-		ctx.project.name,
-		"--template",
-		"cloudflare-workers",
-	]);
-
-	logRaw(""); // newline
-};
-
-const config: TemplateConfig = {
-	configVersion: 1,
-	id: "hono",
+const config: MultiPlatformTemplateConfig = {
 	displayName: "Hono",
-	platform: "workers",
-	generate,
-	devScript: "dev",
-	deployScript: "deploy",
+	platformVariants: { pages, workers },
 };
 export default config;

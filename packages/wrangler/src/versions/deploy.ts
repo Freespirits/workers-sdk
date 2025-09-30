@@ -1,5 +1,4 @@
 import assert from "assert";
-import path from "path";
 import * as cli from "@cloudflare/cli";
 import { brandColor, gray, white } from "@cloudflare/cli/colors";
 import {
@@ -8,226 +7,342 @@ import {
 	leftT,
 	spinnerWhile,
 } from "@cloudflare/cli/interactive";
-import { findWranglerToml, readConfig } from "../config";
+import { fetchResult } from "../cfetch";
+import { createCommand } from "../core/create-command";
 import { UserError } from "../errors";
+import { isNonInteractiveOrCI } from "../is-interactive";
 import * as metrics from "../metrics";
-import { printWranglerBanner } from "../update-check";
+import { writeOutput } from "../output";
+import { APIError } from "../parse";
 import { requireAuth } from "../user";
+import formatLabelledValues from "../utils/render-labelled-values";
 import {
 	createDeployment,
-	fetchLatestDeploymentVersions,
-	fetchLatestUploadedVersions,
+	fetchDeployableVersions,
+	fetchDeploymentVersions,
+	fetchLatestDeployment,
 	fetchVersions,
+	patchNonVersionedScriptSettings,
 } from "./api";
+import type { Config } from "../config";
+import type { ComplianceConfig } from "../environment-variables/misc-variables";
 import type {
-	CommonYargsArgv,
-	StrictYargsOptionsToInterface,
-} from "../yargs-types";
-import type { Percentage, VersionCache, VersionId } from "./types";
+	ApiDeployment,
+	ApiVersion,
+	Percentage,
+	VersionCache,
+	VersionId,
+} from "./types";
 
 const EPSILON = 0.001; // used to avoid floating-point errors. Comparions to a value +/- EPSILON will mean "roughly equals the value".
 const BLANK_INPUT = "-"; // To be used where optional user-input is displayed and the value is nullish
 const ZERO_WIDTH_SPACE = "\u200B"; // Some log lines get trimmed and so, to indent, the line is prefixed with a zero-width space
 
-export type VersionsDeployArgs = StrictYargsOptionsToInterface<
-	typeof versionsDeployOptions
->;
-
 type OptionalPercentage = number | null; // null means automatically assign (evenly distribute remaining traffic)
 
-export function versionsDeployOptions(yargs: CommonYargsArgv) {
-	return yargs
-		.option("name", {
+export const versionsDeployCommand = createCommand({
+	metadata: {
+		description:
+			"Safely roll out new Versions of your Worker by splitting traffic between multiple Versions",
+		owner: "Workers: Authoring and Testing",
+		status: "stable",
+	},
+	behaviour: {
+		useConfigRedirectIfAvailable: true,
+		warnIfMultipleEnvsConfiguredButNoneSpecified: true,
+	},
+
+	args: {
+		name: {
 			describe: "Name of the worker",
 			type: "string",
 			requiresArg: true,
-		})
-		.option("version-id", {
+		},
+		"version-id": {
 			describe: "Worker Version ID(s) to deploy",
-			type: "array",
-			string: true,
+			type: "string",
+			array: true,
 			requiresArg: true,
-		})
-		.option("percentage", {
+		},
+		percentage: {
 			describe:
 				"Percentage of traffic to split between Worker Version(s) (0-100)",
-			type: "array",
-			number: true,
+			array: true,
+			type: "number",
 			requiresArg: true,
-		})
-		.positional("version-specs", {
+		},
+		"version-specs": {
 			describe:
 				"Shorthand notation to deploy Worker Version(s) [<version-id>@<percentage>..]",
 			type: "string",
 			array: true,
-		})
-		.option("message", {
+		},
+		message: {
 			describe: "Description of this deployment (optional)",
 			type: "string",
 			requiresArg: true,
-		})
-		.option("yes", {
+		},
+		yes: {
 			alias: "y",
 			describe: "Automatically accept defaults to prompts",
 			type: "boolean",
 			default: false,
-		})
-		.option("dry-run", {
+		},
+		"dry-run": {
 			describe: "Don't actually deploy",
 			type: "boolean",
 			default: false,
-		})
-		.option("max-versions", {
+		},
+		"max-versions": {
 			hidden: true, // experimental, not supported long-term
 			describe: "Maximum allowed versions to select",
 			type: "number",
 			default: 2, // (when server-side limitation is lifted, we can update this default or just remove the option entirely)
-		});
-}
-
-export async function versionsDeployHandler(args: VersionsDeployArgs) {
-	await printWranglerBanner();
-
-	const config = getConfig(args);
-	await metrics.sendMetricsEvent(
-		"deploy worker versions",
-		{},
-		{
-			sendMetrics: config.send_metrics,
-		}
-	);
-
-	const accountId = await requireAuth(config);
-	const workerName = args.name ?? config.name;
-
-	if (workerName === undefined) {
-		throw new UserError(
-			'You need to provide a name of your worker. Either pass it as a cli arg with `--name <name>` or in your config file as `name = "<name>"`'
-		);
-	}
-
-	const versionCache: VersionCache = new Map();
-	const optionalVersionTraffic = parseVersionSpecs(args);
-
-	cli.startSection(
-		"Deploy Worker Versions",
-		"by splitting traffic between multiple versions",
-		true
-	);
-
-	await printLatestDeployment(accountId, workerName, versionCache);
-
-	// prompt to confirm or change the versionIds from the args
-	const confirmedVersionsToDeploy = await promptVersionsToDeploy(
-		accountId,
-		workerName,
-		[...optionalVersionTraffic.keys()],
-		versionCache,
-		args.yes
-	);
-
-	// validate we have at least 1 version
-	if (confirmedVersionsToDeploy.length === 0) {
-		throw new UserError("You must select at least 1 version to deploy.");
-	}
-
-	// validate we have at most experimentalMaxVersions (default: 2)
-	if (confirmedVersionsToDeploy.length > args.maxVersions) {
-		throw new UserError(
-			`You must select at most ${args.maxVersions} versions to deploy.`
-		);
-	}
-
-	// prompt to confirm or change the percentages for each confirmed version to deploy
-	const confirmedVersionTraffic = await promptPercentages(
-		confirmedVersionsToDeploy,
-		optionalVersionTraffic,
-		args.yes
-	);
-
-	// prompt for deployment message
-	const message = await inputPrompt<string | undefined>({
-		type: "text",
-		label: "Deployment message",
-		defaultValue: args.message,
-		acceptDefault: args.yes,
-		question: "Add a deployment message",
-		helpText: "(optional)",
-	});
-
-	if (args.dryRun) {
-		cli.cancel("--dry-run: exiting");
-		return;
-	}
-
-	const start = Date.now();
-
-	await spinnerWhile({
-		startMessage: `Deploying ${confirmedVersionsToDeploy.length} version(s)`,
-		async promise() {
-			await createDeployment(
-				accountId,
-				workerName,
-				confirmedVersionTraffic,
-				message
-			);
 		},
-	});
+	},
+	positionalArgs: ["version-specs"],
+	handler: async function versionsDeployHandler(args, { config }) {
+		metrics.sendMetricsEvent(
+			"deploy worker versions",
+			{},
+			{
+				sendMetrics: config.send_metrics,
+			}
+		);
 
-	const elapsedMilliseconds = Date.now() - start;
-	const elapsedSeconds = elapsedMilliseconds / 1000;
-	const elapsedString = `${elapsedSeconds.toFixed(2)} sec`;
+		const accountId = await requireAuth(config);
+		const workerName = args.name ?? config.name;
 
-	const trafficSummaryList = Array.from(confirmedVersionTraffic).map(
-		([versionId, percentage]) => `version ${versionId} at ${percentage}%`
-	);
-	const trafficSummaryString = new Intl.ListFormat().format(trafficSummaryList);
+		if (workerName === undefined) {
+			throw new UserError(
+				'You need to provide a name of your worker. Either pass it as a cli arg with `--name <name>` or in your config file as `name = "<name>"`',
+				{ telemetryMessage: true }
+			);
+		}
 
-	cli.success(
-		`Deployed ${workerName} ${trafficSummaryString} (${elapsedString})`
-	);
-}
+		const versionCache: VersionCache = new Map();
+		const optionalVersionTraffic = parseVersionSpecs(args);
 
-function getConfig(
-	args: Pick<VersionsDeployArgs, "config" | "name" | "experimentalJsonConfig">
+		cli.startSection(
+			"Deploy Worker Versions",
+			"by splitting traffic between multiple versions",
+			true
+		);
+
+		await printLatestDeployment(config, accountId, workerName, versionCache);
+
+		// prompt to confirm or change the versionIds from the args
+		const confirmedVersionsToDeploy = await promptVersionsToDeploy(
+			config,
+			accountId,
+			workerName,
+			[...optionalVersionTraffic.keys()],
+			versionCache,
+			args.yes
+		);
+
+		// validate we have at least 1 version
+		if (confirmedVersionsToDeploy.length === 0) {
+			throw new UserError("You must select at least 1 version to deploy.", {
+				telemetryMessage: true,
+			});
+		}
+
+		// validate we have at most experimentalMaxVersions (default: 2)
+		if (confirmedVersionsToDeploy.length > args.maxVersions) {
+			throw new UserError(
+				`You must select at most ${args.maxVersions} versions to deploy.`,
+				{ telemetryMessage: "You must select at most 2 versions to deploy.`" }
+			);
+		}
+
+		// prompt to confirm or change the percentages for each confirmed version to deploy
+		const confirmedVersionTraffic = await promptPercentages(
+			confirmedVersionsToDeploy,
+			optionalVersionTraffic,
+			args.yes
+		);
+
+		// prompt for deployment message
+		const message = await inputPrompt<string | undefined>({
+			type: "text",
+			label: "Deployment message",
+			defaultValue: args.message,
+			acceptDefault: args.yes,
+			question: "Add a deployment message",
+			helpText: "(optional)",
+		});
+
+		if (args.dryRun) {
+			cli.cancel("--dry-run: exiting");
+			return;
+		}
+
+		const start = Date.now();
+
+		const { id: deploymentId } = await spinnerWhile({
+			startMessage: `Deploying ${confirmedVersionsToDeploy.length} version(s)`,
+			promise() {
+				return createDeployment(
+					config,
+					accountId,
+					workerName,
+					confirmedVersionTraffic,
+					message
+				);
+			},
+		});
+
+		await maybePatchSettings(config, accountId, workerName);
+
+		const elapsedMilliseconds = Date.now() - start;
+		const elapsedSeconds = elapsedMilliseconds / 1000;
+		const elapsedString = `${elapsedSeconds.toFixed(2)} sec`;
+
+		const trafficSummaryList = Array.from(confirmedVersionTraffic).map(
+			([versionId, percentage]) => `version ${versionId} at ${percentage}%`
+		);
+		const trafficSummaryString = new Intl.ListFormat("en-US").format(
+			trafficSummaryList
+		);
+
+		cli.success(
+			`Deployed ${workerName} ${trafficSummaryString} (${elapsedString})`
+		);
+
+		let workerTag: string | null = null;
+		try {
+			const serviceMetaData = await fetchResult<{
+				default_environment: { script: { tag: string } };
+			}>(config, `/accounts/${accountId}/workers/services/${workerName}`);
+			workerTag = serviceMetaData.default_environment.script.tag;
+		} catch {
+			// If the fetch fails then we just output a null for the workerTag.
+		}
+		writeOutput({
+			type: "version-deploy",
+			version: 1,
+			worker_name: workerName,
+			worker_tag: workerTag,
+			// NOTE this deploymentId is related to the gradual rollout of the versions given in the version_traffic.
+			deployment_id: deploymentId,
+			version_traffic: confirmedVersionTraffic,
+		});
+	},
+});
+
+/**
+ * Prompts the user for confirmation when overwriting the latest deployment, given that it's split.
+ */
+export async function confirmLatestDeploymentOverwrite(
+	config: Config,
+	accountId: string,
+	scriptName: string
 ) {
-	const configPath =
-		args.config || (args.name && findWranglerToml(path.dirname(args.name)));
-	const config = readConfig(configPath, args);
+	try {
+		const latest = await fetchLatestDeployment(config, accountId, scriptName);
+		if (latest && latest.versions.length >= 2) {
+			const versionCache: VersionCache = new Map();
 
-	return config;
+			// Print message and confirmation.
+
+			cli.warn(
+				`Your last deployment has multiple versions. To progress that deployment use "wrangler versions deploy" instead.`,
+				{ shape: cli.shapes.corners.tl, newlineBefore: false }
+			);
+			cli.newline();
+			await printDeployment(
+				config,
+				accountId,
+				scriptName,
+				latest,
+				"last",
+				versionCache
+			);
+
+			return inputPrompt<boolean>({
+				type: "confirm",
+				question: `"wrangler deploy" will upload a new version and deploy it globally immediately.\nAre you sure you want to continue?`,
+				label: "",
+				defaultValue: isNonInteractiveOrCI(), // defaults to true in CI for back-compat
+				acceptDefault: isNonInteractiveOrCI(),
+			});
+		}
+	} catch (e) {
+		const isNotFound = e instanceof APIError && e.code == 10007;
+		if (!isNotFound) {
+			throw e;
+		}
+	}
+	return true;
 }
 
-async function printLatestDeployment(
+export async function printLatestDeployment(
+	config: Config,
 	accountId: string,
 	workerName: string,
 	versionCache: VersionCache
 ) {
-	const [versions, traffic] = await spinnerWhile({
+	const latestDeployment = await spinnerWhile({
 		startMessage: "Fetching latest deployment",
 		async promise() {
-			return fetchLatestDeploymentVersions(accountId, workerName, versionCache);
+			return fetchLatestDeployment(config, accountId, workerName);
 		},
 	});
-
-	cli.logRaw(
-		`${leftT} Your current deployment has ${versions.length} version(s):`
+	await printDeployment(
+		config,
+		accountId,
+		workerName,
+		latestDeployment,
+		"current",
+		versionCache
 	);
+}
 
-	for (const version of versions) {
-		const trafficString = brandColor(`(${traffic.get(version.id)}%)`);
-		const versionIdString = white(version.id);
+async function printDeployment(
+	config: Config,
+	accountId: string,
+	workerName: string,
+	deployment: ApiDeployment | undefined,
+	adjective: "current" | "last",
+	versionCache: VersionCache
+) {
+	const [versions, traffic] = await fetchDeploymentVersions(
+		config,
+		accountId,
+		workerName,
+		deployment,
+		versionCache
+	);
+	cli.logRaw(
+		`${leftT} Your ${adjective} deployment has ${versions.length} version(s):`
+	);
+	printVersions(versions, traffic);
+}
 
-		cli.log(
-			gray(`
-${trafficString} ${versionIdString}
+export function printVersions(
+	versions: ApiVersion[],
+	traffic: Map<VersionId, Percentage>
+) {
+	cli.newline();
+	cli.log(formatVersions(versions, traffic));
+	cli.newline();
+}
+
+function formatVersions(
+	versions: ApiVersion[],
+	traffic: Map<VersionId, Percentage>
+) {
+	return versions
+		.map((version) => {
+			const trafficString = brandColor(`(${traffic.get(version.id)}%)`);
+			const versionIdString = white(version.id);
+			return gray(`${trafficString} ${versionIdString}
       Created:  ${version.metadata.created_on}
           Tag:  ${version.annotations?.["workers/tag"] ?? BLANK_INPUT}
-      Message:  ${version.annotations?.["workers/message"] ?? BLANK_INPUT}`)
-		);
-	}
-
-	cli.newline();
+      Message:  ${version.annotations?.["workers/message"] ?? BLANK_INPUT}`);
+		})
+		.join("\n\n");
 }
 
 /**
@@ -246,6 +361,7 @@ ${trafficString} ${versionIdString}
  * @returns
  */
 async function promptVersionsToDeploy(
+	complianceConfig: ComplianceConfig,
 	accountId: string,
 	workerName: string,
 	defaultSelectedVersionIds: VersionId[],
@@ -255,8 +371,14 @@ async function promptVersionsToDeploy(
 	await spinnerWhile({
 		startMessage: "Fetching deployable versions",
 		async promise() {
-			await fetchLatestUploadedVersions(accountId, workerName, versionCache);
+			await fetchDeployableVersions(
+				complianceConfig,
+				accountId,
+				workerName,
+				versionCache
+			);
 			await fetchVersions(
+				complianceConfig,
 				accountId,
 				workerName,
 				versionCache,
@@ -379,8 +501,9 @@ async function promptPercentages(
 				const input = val !== "" ? val : defaultValue;
 				const percentage = parseFloat(input?.toString() ?? "");
 
-				if (isNaN(percentage) || percentage < 0 || percentage > 100)
+				if (isNaN(percentage) || percentage < 0 || percentage > 100) {
 					return "Please enter a number between 0 and 100.";
+				}
 			},
 			renderers: {
 				submit({ value }) {
@@ -415,7 +538,9 @@ async function promptPercentages(
 		if (err instanceof UserError) {
 			// if the user has indicated they'll accept all defaults (yesFlag)
 			// then rethrow to avoid an infinite loop of reprompting
-			if (yesFlag) throw err;
+			if (yesFlag) {
+				throw err;
+			}
 
 			cli.error(err.message, undefined, leftT);
 
@@ -433,15 +558,82 @@ async function promptPercentages(
 	return confirmedVersionTraffic;
 }
 
+async function maybePatchSettings(
+	config: Config,
+	accountId: string,
+	workerName: string
+) {
+	const maybeUndefinedSettings = {
+		logpush: config.logpush,
+		tail_consumers: config.tail_consumers,
+		observability: config.observability, // TODO reconcile with how regular deploy handles empty state
+	};
+	const definedSettings = Object.fromEntries(
+		Object.entries(maybeUndefinedSettings).filter(
+			([, value]) => value !== undefined
+		)
+	);
+
+	const hasZeroSettingsToSync = Object.keys(definedSettings).length === 0;
+	if (hasZeroSettingsToSync) {
+		cli.log("No non-versioned settings to sync. Skipping...");
+		return;
+	}
+
+	const patchedSettings = await spinnerWhile({
+		startMessage: `Syncing non-versioned settings`,
+		async promise() {
+			return await patchNonVersionedScriptSettings(
+				config,
+				accountId,
+				workerName,
+				definedSettings
+			);
+		},
+	});
+
+	const observability: Record<string, string> = {};
+	if (patchedSettings.observability) {
+		observability["enabled"] = String(patchedSettings.observability.enabled);
+		if (patchedSettings.observability.head_sampling_rate) {
+			observability["head_sampling_rate"] = String(
+				patchedSettings.observability.head_sampling_rate
+			);
+		}
+	}
+	const formattedSettings = formatLabelledValues(
+		{
+			logpush: String(patchedSettings.logpush ?? "<skipped>"),
+			observability:
+				Object.keys(observability).length > 0
+					? formatLabelledValues(observability)
+					: "<skipped>",
+			tail_consumers:
+				patchedSettings.tail_consumers
+					?.map((tc) =>
+						tc.environment ? `${tc.service} (${tc.environment})` : tc.service
+					)
+					.join("\n") ?? "<skipped>",
+		},
+		{
+			labelJustification: "right",
+			indentationCount: 4,
+		}
+	);
+
+	cli.log("Synced non-versioned settings:\n" + formattedSettings);
+}
+
 // ***********
 //    UNITS
 // ***********
-
+export type ParseVersionSpecsArgs = {
+	percentage?: number[];
+	versionId?: string[];
+	versionSpecs?: string[];
+};
 export function parseVersionSpecs(
-	args: Pick<
-		VersionsDeployArgs,
-		"_" | "versionSpecs" | "versionId" | "percentage"
-	>
+	args: ParseVersionSpecsArgs
 ): Map<VersionId, OptionalPercentage> {
 	const versionIds: string[] = [];
 	const percentages: OptionalPercentage[] = [];

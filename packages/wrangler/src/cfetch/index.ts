@@ -1,14 +1,15 @@
 import { URLSearchParams } from "node:url";
-import { logger } from "../logger";
 import { APIError } from "../parse";
 import { maybeThrowFriendlyError } from "./errors";
-import { fetchInternal, performApiFetch } from "./internal";
+import { fetchInternal } from "./internal";
+import type { ComplianceConfig } from "../environment-variables/misc-variables";
+import type { ApiCredentials } from "../user";
 import type { FetchError } from "./errors";
+import type { ErrorData } from "cloudflare/resources/shared";
 import type { RequestInit } from "undici";
 
 // Check out https://api.cloudflare.com/ for API docs.
 
-export type { FetchError };
 export interface FetchResult<ResponseType = unknown> {
 	success: boolean;
 	result: ResponseType;
@@ -17,22 +18,26 @@ export interface FetchResult<ResponseType = unknown> {
 	result_info?: unknown;
 }
 
-export { fetchKVGetValue } from "./internal";
+export { fetchKVGetValue, performApiFetch } from "./internal";
 
 /**
  * Make a fetch request, and extract the `result` from the JSON response.
  */
 export async function fetchResult<ResponseType>(
+	complianceConfig: ComplianceConfig,
 	resource: string,
 	init: RequestInit = {},
 	queryParams?: URLSearchParams,
-	abortSignal?: AbortSignal
+	abortSignal?: AbortSignal,
+	apiToken?: ApiCredentials
 ): Promise<ResponseType> {
 	const json = await fetchInternal<FetchResult<ResponseType>>(
+		complianceConfig,
 		resource,
 		init,
 		queryParams,
-		abortSignal
+		abortSignal,
+		apiToken
 	);
 	if (json.success) {
 		return json.result;
@@ -45,10 +50,12 @@ export async function fetchResult<ResponseType>(
  * Make a fetch request to the GraphQL API, and return the JSON response.
  */
 export async function fetchGraphqlResult<ResponseType>(
+	complianceConfig: ComplianceConfig,
 	init: RequestInit = {},
 	abortSignal?: AbortSignal
 ): Promise<ResponseType> {
 	const json = await fetchInternal<ResponseType>(
+		complianceConfig,
 		"/graphql",
 		{ ...init, method: "POST" }, //Cloudflare API v4 doesn't allow GETs to /graphql
 		undefined,
@@ -67,6 +74,7 @@ export async function fetchGraphqlResult<ResponseType>(
  * and repeating the request if the results are paginated.
  */
 export async function fetchListResult<ResponseType>(
+	complianceConfig: ComplianceConfig,
 	resource: string,
 	init: RequestInit = {},
 	queryParams?: URLSearchParams
@@ -80,6 +88,7 @@ export async function fetchListResult<ResponseType>(
 			queryParams.set("cursor", cursor);
 		}
 		const json = await fetchInternal<FetchResult<ResponseType[]>>(
+			complianceConfig,
 			resource,
 			init,
 			queryParams
@@ -99,13 +108,14 @@ export async function fetchListResult<ResponseType>(
 }
 
 /**
- * Make a fetch request for a list of values using pages,
+ * Make a fetch request for a list of values,
  * extracting the `result` from the JSON response,
  * and repeating the request if the results are paginated.
  *
  * This is similar to fetchListResult, but it uses the `page` query parameter instead of `cursor`.
  */
 export async function fetchPagedListResult<ResponseType>(
+	complianceConfig: ComplianceConfig,
 	resource: string,
 	init: RequestInit = {},
 	queryParams?: URLSearchParams
@@ -118,6 +128,7 @@ export async function fetchPagedListResult<ResponseType>(
 		queryParams.set("page", String(page));
 
 		const json = await fetchInternal<FetchResult<ResponseType[]>>(
+			complianceConfig,
 			resource,
 			init,
 			queryParams
@@ -162,7 +173,13 @@ function throwFetchError(
 	resource: string,
 	response: FetchResult<unknown>
 ): never {
-	for (const error of response.errors) maybeThrowFriendlyError(error);
+	// This is an error from within an MSW handler
+	if (typeof vitest !== "undefined" && !("errors" in response)) {
+		throw response;
+	}
+	for (const error of response.errors) {
+		maybeThrowFriendlyError(error);
+	}
 
 	const error = new APIError({
 		text: `A request to the Cloudflare API (${resource}) failed.`,
@@ -175,10 +192,17 @@ function throwFetchError(
 	// so consumers can use it for specific behaviour
 	const code = response.errors[0]?.code;
 	if (code) {
-		//@ts-expect-error non-standard property on Error
 		error.code = code;
 	}
+	// extract the account tag from the resource (if any)
+	error.accountTag = extractAccountTag(resource);
 	throw error;
+}
+
+export function extractAccountTag(resource: string) {
+	const re = new RegExp("/accounts/([a-zA-Z0-9]+)/?");
+	const matches = re.exec(resource);
+	return matches?.[1];
 }
 
 function hasCursor(result_info: unknown): result_info is { cursor: string } {
@@ -186,54 +210,22 @@ function hasCursor(result_info: unknown): result_info is { cursor: string } {
 	return cursor !== undefined && cursor !== null && cursor !== "";
 }
 
-function renderError(err: FetchError, level = 0): string {
+export function renderError(err: FetchError | ErrorData, level = 0): string {
+	const indent = "  ".repeat(level);
 	const chainedMessages =
-		err.error_chain
-			?.map(
-				(chainedError) =>
-					`\n${"  ".repeat(level)}- ${renderError(chainedError, level + 1)}`
-			)
-			.join("\n") ?? "";
+		"error_chain" in err
+			? err.error_chain
+					?.map(
+						(chainedError) =>
+							`\n\n${indent}- ${renderError(chainedError, level + 1)}`
+					)
+					.join("\n") ?? ""
+			: "";
 	return (
 		(err.code ? `${err.message} [code: ${err.code}]` : err.message) +
+		(err.documentation_url
+			? `\n${indent}To learn more about this error, visit: ${err.documentation_url}`
+			: "") +
 		chainedMessages
 	);
-}
-
-/**
- * Fetch the raw script content of a Worker
- * Note, this will concatenate the files of multi-module workers
- */
-export async function fetchScriptContent(
-	resource: string,
-	init: RequestInit = {},
-	queryParams?: URLSearchParams,
-	abortSignal?: AbortSignal
-): Promise<string> {
-	const response = await performApiFetch(
-		resource,
-		init,
-		queryParams,
-		abortSignal
-	);
-
-	logger.debug(
-		"-- START CF API RESPONSE:",
-		response.statusText,
-		response.status
-	);
-
-	logger.debug("HEADERS:", { ...response.headers });
-	// logger.debug("RESPONSE:", text);
-	logger.debug("-- END CF API RESPONSE");
-	const contentType = response.headers.get("content-type");
-
-	const usesModules = contentType?.startsWith("multipart");
-	if (usesModules && contentType) {
-		const form = await response.formData();
-		const entries = Array.from(form.entries());
-		return entries.map((e) => e[1]).join("\n");
-	} else {
-		return await response.text();
-	}
 }

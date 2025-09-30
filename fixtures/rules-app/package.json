@@ -1,5 +1,5 @@
 {
-	"name": "rules-app",
+	"name": "@fixture/rules-basic",
 	"private": true,
 	"description": "",
 	"keywords": [],
@@ -7,5 +7,11 @@
 	"author": "",
 	"scripts": {
 		"check:type": "tsc"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "catalog:default"
+	},
+	"volta": {
+		"extends": "../../package.json"
 	}
 }

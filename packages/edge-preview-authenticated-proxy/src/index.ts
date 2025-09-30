@@ -66,7 +66,10 @@ class RawHttpFailed extends HttpError {
 }
 
 class PreviewRequestFailed extends HttpError {
-	constructor(private tokenId: string, reportable: boolean) {
+	constructor(
+		private tokenId: string,
+		reportable: boolean
+	) {
 		super("Token and remote not found", 400, reportable);
 	}
 	get data(): { tokenId: string } {
@@ -84,7 +87,9 @@ class InvalidURL extends HttpError {
 }
 
 function assertValidURL(maybeUrl: string) {
-	if (!URL.canParse(maybeUrl)) throw new InvalidURL(maybeUrl);
+	if (!URL.canParse(maybeUrl)) {
+		throw new InvalidURL(maybeUrl);
+	}
 }
 
 function switchRemote(url: URL, remote: string) {
@@ -199,6 +204,9 @@ async function handleRawHttp(request: Request, url: URL) {
 	const token = requestHeaders.get("X-CF-Token");
 	const remote = requestHeaders.get("X-CF-Remote");
 
+	// Fallback to the request method for backward compatiblility
+	const method = requestHeaders.get("X-CF-Http-Method") ?? request.method;
+
 	if (!token || !remote) {
 		throw new RawHttpFailed();
 	}
@@ -211,14 +219,23 @@ async function handleRawHttp(request: Request, url: URL) {
 	// request due to exceeding size limits if the value is included twice.
 	requestHeaders.delete("X-CF-Token");
 	requestHeaders.delete("X-CF-Remote");
+	requestHeaders.delete("X-CF-Http-Method");
 
-	const workerResponse = await fetch(
-		switchRemote(url, remote),
-		new Request(request, {
-			headers: requestHeaders,
-			redirect: "manual",
-		})
-	);
+	const headerEntries = [...requestHeaders.entries()];
+
+	for (const header of headerEntries) {
+		if (header[0].startsWith("cf-ew-raw-")) {
+			requestHeaders.set(header[0].split("cf-ew-raw-")[1], header[1]);
+			requestHeaders.delete(header[0]);
+		}
+	}
+
+	const workerResponse = await fetch(switchRemote(url, remote), {
+		method,
+		headers: requestHeaders,
+		body: method === "GET" || method === "HEAD" ? null : request.body,
+		redirect: "manual",
+	});
 
 	const responseHeaders = new Headers(workerResponse.headers);
 
@@ -230,6 +247,20 @@ async function handleRawHttp(request: Request, url: URL) {
 		"Access-Control-Expose-Headers": "*",
 		Vary: "Origin",
 	});
+
+	// Pass the raw content type back so that clients can decode the body correctly
+	const contentType = responseHeaders.get("Content-Type");
+	if (contentType) {
+		rawHeaders.set("Content-Type", contentType);
+	}
+	const contentEncoding = responseHeaders.get("Content-Encoding");
+	if (contentEncoding) {
+		rawHeaders.set("Content-Encoding", contentEncoding);
+	}
+	const transferEncoding = responseHeaders.get("Transfer-Encoding");
+	if (transferEncoding) {
+		rawHeaders.set("Transfer-Encoding", transferEncoding);
+	}
 
 	// The client needs the raw headers from the worker
 	// Prefix them with `cf-ew-raw-`, so that response headers from _this_ worker don't interfere

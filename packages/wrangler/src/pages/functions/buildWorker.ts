@@ -1,7 +1,7 @@
+import crypto from "node:crypto";
 import { access, cp, lstat, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { build as esBuild } from "esbuild";
-import { nanoid } from "nanoid";
 import { bundleWorker } from "../../deployment-bundle/bundle";
 import { findAdditionalModules } from "../../deployment-bundle/find-additional-modules";
 import {
@@ -9,29 +9,33 @@ import {
 	noopModuleCollector,
 } from "../../deployment-bundle/module-collection";
 import { FatalError } from "../../errors";
-import { logger } from "../../logger";
+import { logBuildFailure, logger } from "../../logger";
 import { getBasePath } from "../../paths";
 import { getPagesProjectRoot, getPagesTmpDir } from "../utils";
 import type { BundleResult } from "../../deployment-bundle/bundle";
 import type { Entry } from "../../deployment-bundle/entry";
 import type { CfModule } from "../../deployment-bundle/worker";
 import type { Plugin } from "esbuild";
+import type { NodeJSCompatMode } from "miniflare";
 
 export type Options = {
 	routesModule: string;
 	outfile?: string;
 	outdir?: string;
 	minify?: boolean;
+	keepNames?: boolean;
 	sourcemap?: boolean;
 	fallbackService?: string;
 	watch?: boolean;
 	onEnd?: () => void;
 	buildOutputDirectory?: string;
-	legacyNodeCompat?: boolean;
-	nodejsCompat?: boolean;
+	nodejsCompatMode?: NodeJSCompatMode;
 	functionsDirectory: string;
 	local: boolean;
 	defineNavigatorUserAgent: boolean;
+	checkFetch: boolean;
+	external?: string[];
+	metafile?: string | boolean;
 };
 
 export function buildWorkerFromFunctions({
@@ -39,22 +43,27 @@ export function buildWorkerFromFunctions({
 	outfile = join(getPagesTmpDir(), `./functionsWorker-${Math.random()}.js`),
 	outdir,
 	minify = false,
+	keepNames = true,
 	sourcemap = false,
 	fallbackService = "ASSETS",
 	watch = false,
 	onEnd = () => {},
 	buildOutputDirectory,
-	legacyNodeCompat,
-	nodejsCompat,
+	nodejsCompatMode,
 	functionsDirectory,
 	local,
 	defineNavigatorUserAgent,
+	checkFetch,
+	external,
+	metafile,
 }: Options) {
 	const entry: Entry = {
 		file: resolve(getBasePath(), "templates/pages-template-worker.ts"),
-		directory: functionsDirectory,
+		projectRoot: functionsDirectory,
+		configPath: undefined,
 		format: "modules",
 		moduleRoot: functionsDirectory,
+		exports: [],
 	};
 	const moduleCollector = createModuleCollector({
 		entry,
@@ -66,101 +75,34 @@ export function buildWorkerFromFunctions({
 		additionalModules: [],
 		moduleCollector,
 		inject: [routesModule],
-		...(outdir ? { entryName: "index" } : {}),
+		...(outdir ? { entryName: "index" } : { entryName: undefined }),
 		minify,
+		keepNames,
 		sourcemap,
 		watch,
-		legacyNodeCompat,
-		nodejsCompat,
+		nodejsCompatMode,
+		compatibilityDate: undefined,
+		compatibilityFlags: undefined,
 		define: {
 			__FALLBACK_SERVICE__: JSON.stringify(fallbackService),
 		},
+		alias: {},
 		doBindings: [], // Pages functions don't support internal Durable Objects
-		plugins: [
-			buildNotifierPlugin(onEnd),
-			{
-				name: "Assets",
-				setup(pluginBuild) {
-					const identifiers = new Map<string, string>();
-
-					pluginBuild.onResolve({ filter: /^assets:/ }, async (args) => {
-						const directory = resolve(
-							args.resolveDir,
-							args.path.slice("assets:".length)
-						);
-
-						const exists = await access(directory)
-							.then(() => true)
-							.catch(() => false);
-
-						const isDirectory =
-							exists && (await lstat(directory)).isDirectory();
-
-						if (!isDirectory) {
-							return {
-								errors: [
-									{
-										text: `'${directory}' does not exist or is not a directory.`,
-									},
-								],
-							};
-						}
-
-						// TODO: Consider hashing the contents rather than using a unique identifier every time?
-						identifiers.set(directory, nanoid());
-						if (!buildOutputDirectory) {
-							console.warn(
-								"You're attempting to import static assets as part of your Pages Functions, but have not specified a directory in which to put them. You must use 'wrangler pages dev <directory>' rather than 'wrangler pages dev -- <command>' to import static assets in Functions."
-							);
-						}
-						return { path: directory, namespace: "assets" };
-					});
-
-					pluginBuild.onLoad(
-						{ filter: /.*/, namespace: "assets" },
-						async (args) => {
-							const identifier = identifiers.get(args.path);
-
-							if (buildOutputDirectory) {
-								const staticAssetsOutputDirectory = join(
-									buildOutputDirectory,
-									"cdn-cgi",
-									"pages-plugins",
-									identifier as string
-								);
-								await rm(staticAssetsOutputDirectory, {
-									force: true,
-									recursive: true,
-								});
-								await cp(args.path, staticAssetsOutputDirectory, {
-									force: true,
-									recursive: true,
-								});
-
-								return {
-									// TODO: Watch args.path for changes and re-copy when updated
-									contents: `export const onRequest = ({ request, env, functionPath }) => {
-                    const url = new URL(request.url)
-                    const relativePathname = \`/\${url.pathname.replace(functionPath, "") || ""}\`.replace(/^\\/\\//, '/');
-                    url.pathname = '/cdn-cgi/pages-plugins/${identifier}' + relativePathname
-                    request = new Request(url.toString(), request)
-                    return env.ASSETS.fetch(request)
-                  }`,
-								};
-							}
-						}
-					);
-				},
-			},
-		],
+		workflowBindings: [], // Pages functions don't support internal Workflows
+		external,
+		plugins: [buildNotifierPlugin(onEnd), assetsPlugin(buildOutputDirectory)],
 		isOutfile: !outdir,
-		serveAssetsFromWorker: false,
-		checkFetch: local,
+		checkFetch: local && checkFetch,
 		targetConsumer: local ? "dev" : "deploy",
-		forPages: true,
 		local,
 		projectRoot: getPagesProjectRoot(),
 		defineNavigatorUserAgent,
+
+		jsxFactory: undefined,
+		jsxFragment: undefined,
+		tsconfig: undefined,
+		testScheduled: undefined,
+		metafile,
 	});
 }
 
@@ -170,18 +112,21 @@ export type RawOptions = {
 	outdir?: string;
 	directory: string;
 	bundle?: boolean;
-	external?: string[];
+	externalModules?: string[];
 	minify?: boolean;
+	keepNames?: boolean;
 	sourcemap?: boolean;
 	watch?: boolean;
 	plugins?: Plugin[];
 	onEnd?: () => void;
 	buildOutputDirectory?: string;
-	legacyNodeCompat?: boolean;
-	nodejsCompat?: boolean;
+	nodejsCompatMode: NodeJSCompatMode;
 	local: boolean;
 	additionalModules?: CfModule[];
 	defineNavigatorUserAgent: boolean;
+	checkFetch: boolean;
+	external?: string[];
+	metafile?: string | boolean;
 };
 
 /**
@@ -197,25 +142,30 @@ export function buildRawWorker({
 	outdir,
 	directory,
 	bundle = true,
-	external,
+	externalModules,
 	minify = false,
+	keepNames = true,
 	sourcemap = false,
 	watch = false,
 	plugins = [],
 	onEnd = () => {},
-	legacyNodeCompat,
-	nodejsCompat,
+	nodejsCompatMode,
 	local,
 	additionalModules = [],
 	defineNavigatorUserAgent,
+	checkFetch,
+	external,
+	metafile,
 }: RawOptions) {
 	const entry: Entry = {
 		file: workerScriptPath,
-		directory: resolve(directory),
+		projectRoot: resolve(directory),
+		configPath: undefined,
 		format: "modules",
 		moduleRoot: resolve(directory),
+		exports: [],
 	};
-	const moduleCollector = external
+	const moduleCollector = externalModules
 		? noopModuleCollector
 		: createModuleCollector({ entry, findAdditionalModules: false });
 
@@ -224,16 +174,21 @@ export function buildRawWorker({
 		moduleCollector,
 		additionalModules,
 		minify,
+		keepNames,
 		sourcemap,
 		watch,
-		legacyNodeCompat,
-		nodejsCompat,
+		nodejsCompatMode,
+		compatibilityDate: undefined,
+		compatibilityFlags: undefined,
 		define: {},
+		alias: {},
 		doBindings: [], // Pages functions don't support internal Durable Objects
+		workflowBindings: [], // Pages functions don't support internal Workflows
+		external,
 		plugins: [
 			...plugins,
 			buildNotifierPlugin(onEnd),
-			...(external
+			...(externalModules
 				? [
 						// In some cases, we want to enable bundling in esbuild so that we can flatten a shim around the entrypoint, but we still don't want to actually bundle in all the chunks that a Worker references.
 						// This plugin allows us to mark those chunks as external so they are not inlined.
@@ -241,53 +196,83 @@ export function buildRawWorker({
 							name: "external-fixer",
 							setup(pluginBuild) {
 								pluginBuild.onResolve({ filter: /.*/ }, async (args) => {
-									if (external.includes(resolve(args.resolveDir, args.path))) {
+									if (
+										externalModules.includes(
+											resolve(args.resolveDir, args.path)
+										)
+									) {
 										return { path: args.path, external: true };
 									}
 								});
 							},
 						} as Plugin,
-				  ]
+					]
 				: []),
 		],
 		isOutfile: !outdir,
-		serveAssetsFromWorker: false,
-		checkFetch: local,
+		checkFetch: local && checkFetch,
 		targetConsumer: local ? "dev" : "deploy",
-		forPages: true,
 		local,
 		projectRoot: getPagesProjectRoot(),
 		defineNavigatorUserAgent,
+		metafile,
+
+		jsxFactory: undefined,
+		jsxFragment: undefined,
+		tsconfig: undefined,
+		testScheduled: undefined,
+		entryName: undefined,
+		inject: undefined,
 	});
 }
 
-export async function traverseAndBuildWorkerJSDirectory({
+export async function produceWorkerBundleForWorkerJSDirectory({
 	workerJSDirectory,
+	bundle,
 	buildOutputDirectory,
-	nodejsCompat,
+	nodejsCompatMode,
 	defineNavigatorUserAgent,
+	checkFetch,
+	sourceMaps,
 }: {
 	workerJSDirectory: string;
+	bundle: boolean;
 	buildOutputDirectory: string;
-	nodejsCompat?: boolean;
+	nodejsCompatMode: NodeJSCompatMode;
 	defineNavigatorUserAgent: boolean;
+	checkFetch: boolean;
+	sourceMaps: boolean;
 }): Promise<BundleResult> {
 	const entrypoint = resolve(join(workerJSDirectory, "index.js"));
 
 	const additionalModules = await findAdditionalModules(
 		{
 			file: entrypoint,
-			directory: resolve(workerJSDirectory),
+			projectRoot: resolve(workerJSDirectory),
+			configPath: undefined,
 			format: "modules",
 			moduleRoot: resolve(workerJSDirectory),
+			exports: [],
 		},
 		[
 			{
 				type: "ESModule",
 				globs: ["**/*.js", "**/*.mjs"],
 			},
-		]
+		],
+		sourceMaps
 	);
+
+	if (!bundle) {
+		return {
+			modules: additionalModules,
+			dependencies: {},
+			resolvedEntryPointPath: entrypoint,
+			bundleType: "esm",
+			stop: async () => {},
+			sourceMapPath: undefined,
+		};
+	}
 
 	const outfile = join(
 		getPagesTmpDir(),
@@ -296,18 +281,20 @@ export async function traverseAndBuildWorkerJSDirectory({
 	const bundleResult = await buildRawWorker({
 		workerScriptPath: entrypoint,
 		bundle: true,
-		external: additionalModules.map((m) => join(workerJSDirectory, m.name)),
+		externalModules: additionalModules.map((m) =>
+			join(workerJSDirectory, m.name)
+		),
 		outfile,
 		directory: buildOutputDirectory,
 		local: false,
 		sourcemap: true,
 		watch: false,
 		onEnd: () => {},
-		nodejsCompat,
+		nodejsCompatMode,
 		additionalModules,
 		defineNavigatorUserAgent,
+		checkFetch,
 	});
-
 	return {
 		modules: bundleResult.modules,
 		dependencies: bundleResult.dependencies,
@@ -327,19 +314,13 @@ export function buildNotifierPlugin(onEnd: () => void): Plugin {
 		name: "wrangler notifier and monitor",
 		setup(pluginBuild) {
 			pluginBuild.onEnd((result) => {
-				if (result.errors.length > 0) {
-					logger.error(
-						`${result.errors.length} error(s) and ${result.warnings.length} warning(s) when compiling Worker.`
-					);
-				} else if (result.warnings.length > 0) {
-					logger.warn(
-						`${result.warnings.length} warning(s) when compiling Worker.`
-					);
-					onEnd();
+				if (result.errors.length > 0 || result.warnings.length > 0) {
+					logBuildFailure(result.errors, result.warnings);
 				} else {
 					logger.log("✨ Compiled Worker successfully");
-					onEnd();
 				}
+
+				onEnd();
 			});
 		},
 	};
@@ -353,7 +334,7 @@ export function buildNotifierPlugin(onEnd: () => void): Plugin {
  */
 export async function checkRawWorker(
 	scriptPath: string,
-	nodejsCompat: boolean,
+	nodejsCompatMode: NodeJSCompatMode,
 	onEnd: () => void
 ) {
 	await esBuild({
@@ -361,16 +342,19 @@ export async function checkRawWorker(
 		write: false,
 		// we need it to be bundled so that any imports that are used are affected by the blocker plugin
 		bundle: true,
-		plugins: [blockWorkerJsImports(nodejsCompat), buildNotifierPlugin(onEnd)],
+		plugins: [
+			blockWorkerJsImports(nodejsCompatMode),
+			buildNotifierPlugin(onEnd),
+		],
 		logLevel: "silent",
 	});
 }
 
-function blockWorkerJsImports(nodejsCompat: boolean): Plugin {
+function blockWorkerJsImports(nodejsCompatMode: NodeJSCompatMode): Plugin {
 	return {
 		name: "block-worker-js-imports",
 		setup(build) {
-			build.onResolve({ filter: /.*/g }, (args) => {
+			build.onResolve({ filter: /.*/ }, (args) => {
 				// If it's the entrypoint, let it be as is
 				if (args.kind === "entry-point") {
 					return {
@@ -379,7 +363,8 @@ function blockWorkerJsImports(nodejsCompat: boolean): Plugin {
 				}
 				// If it's a node or cf built-in, mark it as external
 				if (
-					(nodejsCompat && args.path.startsWith("node:")) ||
+					((nodejsCompatMode === "v1" || nodejsCompatMode === "v2") &&
+						args.path.startsWith("node:")) ||
 					args.path.startsWith("cloudflare:")
 				) {
 					return {
@@ -395,6 +380,82 @@ function blockWorkerJsImports(nodejsCompat: boolean): Plugin {
 					1
 				);
 			});
+		},
+	};
+}
+
+function assetsPlugin(buildOutputDirectory: string | undefined): Plugin {
+	return {
+		name: "Assets",
+		setup(pluginBuild) {
+			const identifiers = new Map<string, string>();
+
+			pluginBuild.onResolve({ filter: /^assets:/ }, async (args) => {
+				const directory = resolve(
+					args.resolveDir,
+					args.path.slice("assets:".length)
+				);
+
+				const exists = await access(directory)
+					.then(() => true)
+					.catch(() => false);
+
+				const isDirectory = exists && (await lstat(directory)).isDirectory();
+
+				if (!isDirectory) {
+					return {
+						errors: [
+							{
+								text: `'${directory}' does not exist or is not a directory.`,
+							},
+						],
+					};
+				}
+
+				// TODO: Consider hashing the contents rather than using a unique identifier every time?
+				identifiers.set(directory, crypto.randomUUID());
+				if (!buildOutputDirectory) {
+					logger.warn(
+						"You're attempting to import static assets as part of your Pages Functions, but have not specified a directory in which to put them. You must use 'wrangler pages dev <directory>' rather than 'wrangler pages dev -- <command>' to import static assets in Functions."
+					);
+				}
+				return { path: directory, namespace: "assets" };
+			});
+
+			pluginBuild.onLoad(
+				{ filter: /.*/, namespace: "assets" },
+				async (args) => {
+					const identifier = identifiers.get(args.path);
+
+					if (buildOutputDirectory) {
+						const staticAssetsOutputDirectory = join(
+							buildOutputDirectory,
+							"cdn-cgi",
+							"pages-plugins",
+							identifier as string
+						);
+						await rm(staticAssetsOutputDirectory, {
+							force: true,
+							recursive: true,
+						});
+						await cp(args.path, staticAssetsOutputDirectory, {
+							force: true,
+							recursive: true,
+						});
+
+						return {
+							// TODO: Watch args.path for changes and re-copy when updated
+							contents: `export const onRequest = ({ request, env, functionPath }) => {
+								const url = new URL(request.url);
+								const relativePathname = \`/\${url.pathname.replace(functionPath, "") || ""}\`.replace(/^\\/\\//, '/');
+								url.pathname = '/cdn-cgi/pages-plugins/${identifier}' + relativePathname;
+								request = new Request(url.toString(), request);
+								return env.ASSETS.fetch(request);
+							}`,
+						};
+					}
+				}
+			);
 		},
 	};
 }

@@ -1,84 +1,81 @@
-import path from "path";
 import { logRaw } from "@cloudflare/cli";
-import { findWranglerToml, readConfig } from "../config";
+import { createCommand } from "../core/create-command";
 import { UserError } from "../errors";
 import * as metrics from "../metrics";
-import { printWranglerBanner } from "../update-check";
 import { requireAuth } from "../user";
 import formatLabelledValues from "../utils/render-labelled-values";
-import { fetchLatestUploadedVersions } from "./api";
-import type {
-	CommonYargsArgv,
-	StrictYargsOptionsToInterface,
-} from "../yargs-types";
+import { fetchDeployableVersions } from "./api";
 import type { ApiVersion, VersionCache } from "./types";
 
 const BLANK_INPUT = "-"; // To be used where optional user-input is displayed and the value is nullish
 
-export type VersionsListArgs = StrictYargsOptionsToInterface<
-	typeof versionsListOptions
->;
-
-export function versionsListOptions(yargs: CommonYargsArgv) {
-	return yargs.option("name", {
-		describe: "Name of the worker",
-		type: "string",
-		requiresArg: true,
-	});
-}
-
-export async function versionsListHandler(args: VersionsListArgs) {
-	await printWranglerBanner();
-
-	const config = getConfig(args);
-	await metrics.sendMetricsEvent(
-		"list worker versions",
-		{},
-		{
-			sendMetrics: config.send_metrics,
-		}
-	);
-
-	const accountId = await requireAuth(config);
-	const workerName = args.name ?? config.name;
-
-	if (workerName === undefined) {
-		throw new UserError(
-			'You need to provide a name of your worker. Either pass it as a cli arg with `--name <name>` or in your config file as `name = "<name>"`'
+export const versionsListCommand = createCommand({
+	metadata: {
+		description: "List the 10 most recent Versions of your Worker",
+		owner: "Workers: Authoring and Testing",
+		status: "stable",
+	},
+	behaviour: {
+		printBanner: (args) => !args.json,
+	},
+	args: {
+		name: {
+			describe: "Name of the Worker",
+			type: "string",
+			requiresArg: true,
+		},
+		json: {
+			describe: "Display output as clean JSON",
+			type: "boolean",
+			default: false,
+		},
+	},
+	handler: async function versionsListHandler(args, { config }) {
+		metrics.sendMetricsEvent(
+			"list worker versions",
+			{ json: args.json },
+			{
+				sendMetrics: config.send_metrics,
+			}
 		);
-	}
 
-	const versionCache: VersionCache = new Map();
-	const versions = await fetchLatestUploadedVersions(
-		accountId,
-		workerName,
-		versionCache
-	);
+		const accountId = await requireAuth(config);
+		const workerName = args.name ?? config.name;
 
-	for (const version of versions) {
-		const formattedVersion = formatLabelledValues({
-			"Version ID": version.id,
-			Created: new Date(version.metadata["created_on"]).toISOString(),
-			Author: version.metadata.author_email,
-			Source: getVersionSource(version),
-			Tag: version.annotations?.["workers/tag"] || BLANK_INPUT,
-			Message: version.annotations?.["workers/message"] || BLANK_INPUT,
-		});
+		if (workerName === undefined) {
+			throw new UserError(
+				'You need to provide a name of your worker. Either pass it as a cli arg with `--name <name>` or in your config file as `name = "<name>"`',
+				{ telemetryMessage: true }
+			);
+		}
 
-		logRaw(formattedVersion);
-		logRaw(``);
-	}
-}
+		const versionCache: VersionCache = new Map();
+		const versions = (
+			await fetchDeployableVersions(config, accountId, workerName, versionCache)
+		).sort((a, b) =>
+			a.metadata.created_on.localeCompare(b.metadata.created_on)
+		);
 
-export function getConfig(
-	args: Pick<VersionsListArgs, "config" | "name" | "experimentalJsonConfig">
-) {
-	const configPath =
-		args.config || (args.name && findWranglerToml(path.dirname(args.name)));
-	const config = readConfig(configPath, args);
+		if (args.json) {
+			logRaw(JSON.stringify(versions, null, 2));
+			return;
+		}
 
-	return config;
-}
+		for (const version of versions) {
+			const formattedVersion = formatLabelledValues({
+				"Version ID": version.id,
+				Created: new Date(version.metadata["created_on"]).toISOString(),
+				Author: version.metadata.author_email,
+				Source: getVersionSource(version),
+				Tag: version.annotations?.["workers/tag"] || BLANK_INPUT,
+				Message: version.annotations?.["workers/message"] || BLANK_INPUT,
+			});
+
+			logRaw(formattedVersion);
+			logRaw(``);
+		}
+	},
+});
 
 export function getVersionSource(version: {
 	metadata: Pick<ApiVersion["metadata"], "source">;
@@ -92,7 +89,7 @@ export function getVersionSource(version: {
 		: formatTrigger(version.annotations["workers/triggered_by"]);
 }
 
-export function formatSource(source: string): string {
+function formatSource(source: string): string {
 	switch (source) {
 		case "api":
 			return "API 📡";
@@ -106,7 +103,7 @@ export function formatSource(source: string): string {
 			return `Other (${source})`;
 	}
 }
-export function formatTrigger(trigger: string): string {
+function formatTrigger(trigger: string): string {
 	switch (trigger) {
 		case "upload":
 			return "Upload";

@@ -1,19 +1,9 @@
-import { handler as addHandler, options as addOptions } from "./add";
-import { handler as removeHandler, options as removeOptions } from "./remove";
-import type { CommonYargsArgv } from "../../../../yargs-types";
+import { createNamespace } from "../../../../core/create-command";
 
-export function consumers(yargs: CommonYargsArgv) {
-	yargs.command(
-		"add <queue-name> <script-name>",
-		"Add a Queue Consumer",
-		addOptions,
-		addHandler
-	);
-
-	yargs.command(
-		"remove <queue-name> <script-name>",
-		"Remove a Queue Consumer",
-		removeOptions,
-		removeHandler
-	);
-}
+export const queuesConsumerNamespace = createNamespace({
+	metadata: {
+		description: "Configure queue consumers",
+		owner: "Product: Queues",
+		status: "stable",
+	},
+});

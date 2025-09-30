@@ -2,6 +2,8 @@ import path from "node:path";
 import {
 	formatZodError,
 	getRootPath,
+	Log,
+	LogLevel,
 	mergeWorkerOptions,
 	parseWithRootPath,
 	PLUGINS,
@@ -11,7 +13,12 @@ import { getProjectPath, getRelativeProjectPath } from "./helpers";
 import type { ModuleRule, WorkerOptions } from "miniflare";
 import type { ProvidedContext } from "vitest";
 import type { WorkspaceProject } from "vitest/node";
+import type { Binding, RemoteProxySession } from "wrangler";
 import type { ParseParams, ZodError } from "zod";
+
+export interface WorkersConfigPluginAPI {
+	setMain(newMain?: string): void;
+}
 
 const PLUGIN_VALUES = Object.values(PLUGINS);
 
@@ -38,6 +45,11 @@ const WorkersPoolOptionsSchema = z.object({
 	 */
 	isolatedStorage: z.boolean().default(true),
 	/**
+	 * Enables remote bindings to access remote resources configured
+	 * with `remote: true` in the wrangler configuration file.
+	 */
+	remoteBindings: z.boolean().default(true),
+	/**
 	 * Runs all tests in this project serially in the same worker, using the same
 	 * module cache. This can significantly speed up tests if you've got lots of
 	 * small test files.
@@ -49,7 +61,9 @@ const WorkersPoolOptionsSchema = z.object({
 		})
 		.passthrough()
 		.optional(),
-	wrangler: z.object({ configPath: z.ostring() }).optional(),
+	wrangler: z
+		.object({ configPath: z.ostring(), environment: z.ostring() })
+		.optional(),
 });
 export type SourcelessWorkerOptions = Omit<
 	WorkerOptions,
@@ -82,9 +96,14 @@ function isZodErrorLike(value: unknown): value is ZodError {
 
 type ZodErrorRef = { value?: ZodError };
 function coalesceZodErrors(ref: ZodErrorRef, thrown: unknown) {
-	if (!isZodErrorLike(thrown)) throw thrown;
-	if (ref.value === undefined) ref.value = thrown;
-	else ref.value.issues.push(...thrown.issues);
+	if (!isZodErrorLike(thrown)) {
+		throw thrown;
+	}
+	if (ref.value === undefined) {
+		ref.value = thrown;
+	} else {
+		ref.value.issues.push(...thrown.issues);
+	}
 }
 
 function parseWorkerOptions(
@@ -113,12 +132,59 @@ function parseWorkerOptions(
 			coalesceZodErrors(errorRef, e);
 		}
 	}
-	if (errorRef.value !== undefined) throw errorRef.value;
+	if (errorRef.value !== undefined) {
+		throw errorRef.value;
+	}
 
 	// Remove the placeholder script added if any
-	if (withoutScript) delete value["script"];
+	if (withoutScript) {
+		delete value["script"];
+	}
 	return result;
 }
+
+const log = new Log(LogLevel.WARN, { prefix: "vpw" });
+
+function filterTails(
+	tails: WorkerOptions["tails"],
+	userWorkers?: { name?: string }[]
+) {
+	// Only connect the tail consumers that represent Workers that are defined in the Vitest config. Warn that a tail will be omitted otherwise
+	// This _differs from service bindings_ because tail consumers are "optional" in a sense, and shouldn't affect the runtime behaviour of a Worker
+	return tails?.filter((tailService) => {
+		let name: string;
+		if (typeof tailService === "string") {
+			name = tailService;
+		} else if (
+			typeof tailService === "object" &&
+			"name" in tailService &&
+			typeof tailService.name === "string"
+		) {
+			name = tailService.name;
+		} else {
+			// Don't interfere with network-based tail connections (e.g. via the dev registry), or kCurrentWorker
+			return true;
+		}
+		const found = userWorkers?.some((w) => w.name === name);
+
+		if (!found) {
+			log.warn(
+				`Tail consumer "${name}" was not found in your config. Make sure you add it if you'd like to simulate receiving tail events locally.`
+			);
+		}
+
+		return found;
+	});
+}
+
+/** Map that maps worker configPaths to their existing remote proxy session data (if any) */
+const remoteProxySessionsDataMap = new Map<
+	string,
+	{
+		session: RemoteProxySession;
+		remoteBindings: Record<string, Binding>;
+	} | null
+>();
 
 async function parseCustomPoolOptions(
 	rootPath: string,
@@ -148,6 +214,7 @@ async function parseCustomPoolOptions(
 		coalesceZodErrors(errorRef, e);
 	}
 
+	options.miniflare.workers = [];
 	// Try to parse auxiliary worker options
 	if (workers !== undefined) {
 		options.miniflare.workers = workers.map((worker, i) => {
@@ -169,7 +236,9 @@ async function parseCustomPoolOptions(
 		});
 	}
 
-	if (errorRef.value !== undefined) throw errorRef.value;
+	if (errorRef.value !== undefined) {
+		throw errorRef.value;
+	}
 
 	// Try to parse Wrangler config if any
 	if (options.wrangler?.configPath !== undefined) {
@@ -180,18 +249,93 @@ async function parseCustomPoolOptions(
 
 		// Lazily import `wrangler` if and when we need it
 		const wrangler = await import("wrangler");
-		const { workerOptions, define, main } =
-			wrangler.unstable_getMiniflareWorkerOptions(configPath);
+
+		const preExistingRemoteProxySessionData = options.wrangler?.configPath
+			? remoteProxySessionsDataMap.get(options.wrangler.configPath)
+			: undefined;
+
+		const remoteProxySessionData =
+			options.remoteBindings ?? true
+				? await wrangler.maybeStartOrUpdateRemoteProxySession(
+						{
+							path: options.wrangler.configPath,
+							environment: options.wrangler.environment,
+						},
+						preExistingRemoteProxySessionData ?? null
+					)
+				: null;
+
+		if (options.wrangler?.configPath && remoteProxySessionData) {
+			remoteProxySessionsDataMap.set(
+				options.wrangler.configPath,
+				remoteProxySessionData
+			);
+		}
+
+		const { workerOptions, externalWorkers, define, main } =
+			wrangler.unstable_getMiniflareWorkerOptions(
+				configPath,
+				options.wrangler.environment,
+				{
+					imagesLocalMode: true,
+					overrides: {
+						assets: options.miniflare.assets,
+						// doesn't work with containers yet so let's just disable it
+						enableContainers: false,
+					},
+					remoteBindingsEnabled: options.remoteBindings ?? true,
+					remoteProxyConnectionString:
+						remoteProxySessionData?.session?.remoteProxyConnectionString,
+				}
+			);
+
+		const wrappedBindings = Object.values(workerOptions.wrappedBindings ?? {});
+
+		const hasAIOrVectorizeBindings = wrappedBindings.some((binding) => {
+			return (
+				typeof binding === "object" &&
+				(binding.scriptName.includes("__WRANGLER_EXTERNAL_VECTORIZE_WORKER") ||
+					binding.scriptName.includes("__WRANGLER_EXTERNAL_AI_WORKER"))
+			);
+		});
+
+		if (hasAIOrVectorizeBindings) {
+			log.warn(
+				"Workers AI and Vectorize bindings will access your Cloudflare account and incur usage charges even in testing. We recommend mocking any usage of these bindings in your tests."
+			);
+		}
 
 		// If `main` wasn't explicitly configured, fall back to Wrangler config's
 		options.main ??= main;
+
+		options.miniflare.workers = [
+			...options.miniflare.workers,
+			...externalWorkers,
+		];
+
 		// Merge generated Miniflare options from Wrangler with specified overrides
 		options.miniflare = mergeWorkerOptions(
 			workerOptions,
 			options.miniflare as SourcelessWorkerOptions
 		);
+
+		options.miniflare = {
+			...options.miniflare,
+			tails: filterTails(workerOptions.tails, options.miniflare.workers),
+		};
+
 		// Record any Wrangler `define`s
 		options.defines = define;
+	}
+
+	// Some assets plumbing that should be hidden from the end user
+	if (options.miniflare?.assets) {
+		// (Used to set the SELF binding to point to the router worker instead)
+		options.miniflare.hasAssetsAndIsVitest = true;
+		options.miniflare.assets.routerConfig ??= {};
+		options.miniflare.assets.routerConfig.has_user_worker = Boolean(
+			options.main
+		);
 	}
 
 	return options;
@@ -230,7 +374,7 @@ export async function parseProjectOptions(
 	let workersPoolOptions = poolOptions?.workers ?? {};
 	try {
 		if (typeof workersPoolOptions === "function") {
-			// https://github.com/vitest-dev/vitest/blob/v1.0.0/packages/vitest/src/integrations/inject.ts
+			// https://github.com/vitest-dev/vitest/blob/v2.1.1/packages/vitest/src/integrations/inject.ts
 			const inject = <K extends keyof ProvidedContext>(
 				key: K
 			): ProvidedContext[K] => {
@@ -242,13 +386,15 @@ export async function parseProjectOptions(
 			path: OPTIONS_PATH_ARRAY,
 		});
 	} catch (e) {
-		if (!isZodErrorLike(e)) throw e;
+		if (!isZodErrorLike(e)) {
+			throw e;
+		}
 		let formatted: string;
 		try {
 			formatted = formatZodError(e, {
 				test: { poolOptions: { workers: workersPoolOptions } },
 			});
-		} catch (error) {
+		} catch {
 			throw e;
 		}
 		const relativePath = getRelativeProjectPath(project);

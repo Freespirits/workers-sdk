@@ -1,5 +1,6 @@
 import assert from "node:assert";
 import { Buffer } from "node:buffer";
+import { parse, stringify } from "devalue";
 import type {
 	Blob as WorkerBlob,
 	BlobOptions as WorkerBlobOptions,
@@ -10,7 +11,6 @@ import type {
 	Request as WorkerRequest,
 	Response as WorkerResponse,
 } from "@cloudflare/workers-types/experimental";
-import { parse, stringify } from "devalue";
 
 // This file implements `devalue` reducers and revivers for structured-
 // serialisable types not supported by default. See serialisable types here:
@@ -20,7 +20,7 @@ export type ReducerReviver = (value: unknown) => unknown;
 export type ReducersRevivers = Record<string, ReducerReviver>;
 
 const ALLOWED_ARRAY_BUFFER_VIEW_CONSTRUCTORS = [
-	DataView,
+	DataView<ArrayBuffer>,
 	Int8Array,
 	Uint8Array,
 	Uint8ClampedArray,
@@ -60,6 +60,13 @@ export const structuredSerializableReducers: ReducersRevivers = {
 			];
 		}
 	},
+	RegExp(value) {
+		if (value instanceof RegExp) {
+			const { source, flags } = value;
+			const encoded = Buffer.from(source).toString("base64");
+			return flags ? ["RegExp", encoded, flags] : ["RegExp", encoded];
+		}
+	},
 	Error(value) {
 		for (const ctor of ALLOWED_ERROR_CONSTRUCTORS) {
 			if (value instanceof ctor && value.name === ctor.name) {
@@ -95,7 +102,15 @@ export const structuredSerializableRevivers: ReducersRevivers = {
 		assert(ALLOWED_ARRAY_BUFFER_VIEW_CONSTRUCTORS.includes(ctor));
 		let length = byteLength;
 		if ("BYTES_PER_ELEMENT" in ctor) length /= ctor.BYTES_PER_ELEMENT;
-		return new ctor(buffer, byteOffset, length);
+		return new ctor(buffer as ArrayBuffer, byteOffset, length);
+	},
+	RegExp(value) {
+		assert(Array.isArray(value));
+		const [name, encoded, flags] = value;
+		assert(typeof name === "string");
+		assert(typeof encoded === "string");
+		const source = Buffer.from(encoded, "base64").toString("utf-8");
+		return new RegExp(source, flags);
 	},
 	Error(value) {
 		assert(Array.isArray(value));
@@ -134,7 +149,7 @@ export function createHTTPReducers(
 ): ReducersRevivers {
 	return {
 		Headers(val) {
-			if (val instanceof impl.Headers) return Object.fromEntries(val);
+			if (val instanceof impl.Headers) return [...val.entries()];
 		},
 		Request(val) {
 			if (val instanceof impl.Request) {
@@ -154,7 +169,7 @@ export function createHTTPRevivers<RS>(
 	return {
 		Headers(value) {
 			assert(typeof value === "object" && value !== null);
-			return new impl.Headers(value as Record<string, string>);
+			return new impl.Headers(value as string[][]);
 		},
 		Request(value) {
 			assert(Array.isArray(value));
@@ -234,6 +249,11 @@ export function stringifyWithStreams<RS>(
 
 		...reducers,
 	};
+	if (typeof value === "function") {
+		value = new __MiniflareFunctionWrapper(
+			value as ConstructorParameters<typeof __MiniflareFunctionWrapper>[0]
+		);
+	}
 	const stringifiedValue = stringify(value, streamReducers);
 	// If we didn't need to buffer anything, we've just encoded correctly. Note
 	// `unbufferedStream` may be undefined if the `value` didn't contain streams.
@@ -270,6 +290,25 @@ export function stringifyWithStreams<RS>(
 		return { value: stringifiedValue, unbufferedStream };
 	});
 }
+
+// functions can't be stringified, so we wrap them into a class that we then use to pseudo-serialize them
+// we also add a proxy and make sure that properties set on the function object are accessible
+// (this is in particular necessary for RpcStubs)
+export class __MiniflareFunctionWrapper {
+	constructor(
+		fnWithProps: ((...args: unknown[]) => unknown) & {
+			[key: string | symbol]: unknown;
+		}
+	) {
+		return new Proxy(this, {
+			get: (_, key) => {
+				if (key === "__miniflareWrappedFunction") return fnWithProps;
+				return fnWithProps[key];
+			},
+		});
+	}
+}
+
 export function parseWithReadableStreams<RS>(
 	impl: PlatformImpl<RS>,
 	stringified: StringifiedWithStream<RS>,

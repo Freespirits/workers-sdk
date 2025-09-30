@@ -3,11 +3,12 @@ import path from "path";
 import { brandColor, dim } from "@cloudflare/cli/colors";
 import semver from "semver";
 import whichPmRuns from "which-pm-runs";
-import { devDependencies } from "../../package.json";
+import {
+	testPackageManager,
+	testPackageManagerVersion,
+} from "../../e2e/helpers/constants";
 import { runCommand } from "./command";
 import type { C3Context } from "types";
-
-export type PmName = "pnpm" | "npm" | "yarn" | "bun";
 
 /**
  * Detects the package manager which was used to invoke C3 and provides a map of its associated commands.
@@ -19,33 +20,14 @@ export type PmName = "pnpm" | "npm" | "yarn" | "bun";
  * - dlx: executing packages that are not installed locally (ex. `pnpm dlx create-solid`)
  */
 export const detectPackageManager = () => {
-	const pmInfo = whichPmRuns() as { name: PmName; version: string } | undefined;
+	const pmInfo = whichPmRuns();
 
 	let { name, version } = pmInfo ?? { name: "npm", version: "0.0.0" };
 
-	if (process.env.TEST_PM) {
-		switch (process.env.TEST_PM) {
-			case "pnpm":
-				name = "pnpm";
-				version = devDependencies["pnpm"].replace("^", "");
-				process.env.npm_config_user_agent = "pnpm";
-				break;
-			case "yarn":
-				name = "yarn";
-				version = devDependencies["yarn"].replace("^", "");
-				process.env.npm_config_user_agent = "yarn";
-				break;
-			case "bun":
-				name = "bun";
-				version = "1.0.0";
-				process.env.npm_config_user_agent = "bun";
-				break;
-			case "npm":
-				name = "npm";
-				version = "0.0.0";
-				process.env.npm_config_user_agent = "npm";
-				break;
-		}
+	if (testPackageManager && testPackageManagerVersion) {
+		name = testPackageManager;
+		version = testPackageManagerVersion;
+		process.env.npm_config_user_agent = `${name}/${version}`;
 	}
 
 	switch (name) {
@@ -122,10 +104,14 @@ export const rectifyPmMismatch = async (ctx: C3Context) => {
 	}
 
 	const nodeModulesPath = path.join(ctx.project.path, "node_modules");
-	if (existsSync(nodeModulesPath)) rmSync(nodeModulesPath, { recursive: true });
+	if (existsSync(nodeModulesPath)) {
+		rmSync(nodeModulesPath, { recursive: true });
+	}
 
 	const lockfilePath = path.join(ctx.project.path, "package-lock.json");
-	if (existsSync(lockfilePath)) rmSync(lockfilePath);
+	if (existsSync(lockfilePath)) {
+		rmSync(lockfilePath);
+	}
 
 	await runCommand([npm, "install"], {
 		silent: true,
@@ -135,7 +121,7 @@ export const rectifyPmMismatch = async (ctx: C3Context) => {
 	});
 };
 
-const detectPmMismatch = (ctx: C3Context) => {
+export const detectPmMismatch = (ctx: C3Context) => {
 	const { npm } = detectPackageManager();
 	const projectPath = ctx.project.path;
 
@@ -147,6 +133,9 @@ const detectPmMismatch = (ctx: C3Context) => {
 		case "pnpm":
 			return !existsSync(path.join(projectPath, "pnpm-lock.yaml"));
 		case "bun":
-			return !existsSync(path.join(projectPath, "bun.lockb"));
+			return (
+				!existsSync(path.join(projectPath, "bun.lockb")) &&
+				!existsSync(path.join(projectPath, "bun.lock"))
+			);
 	}
 };

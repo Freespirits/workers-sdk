@@ -1,19 +1,9 @@
 import assert from "node:assert";
-import fs from "node:fs";
 import url from "node:url";
+import { maybeGetFile } from "@cloudflare/workers-shared";
 import { getFreshSourceMapSupport } from "miniflare";
 import type { Options } from "@cspotcode/source-map-support";
 import type Protocol from "devtools-protocol";
-
-function maybeGetFile(filePath: string | URL) {
-	try {
-		return fs.readFileSync(filePath, "utf8");
-	} catch (e: unknown) {
-		const notFound =
-			typeof e === "object" && e !== null && "code" in e && e.code === "ENOENT";
-		if (!notFound) throw e;
-	}
-}
 
 export type RetrieveSourceMapFunction = NonNullable<
 	Options["retrieveSourceMap"]
@@ -21,15 +11,21 @@ export type RetrieveSourceMapFunction = NonNullable<
 export function maybeRetrieveFileSourceMap(
 	filePath?: string
 ): ReturnType<RetrieveSourceMapFunction> {
-	if (filePath === undefined) return null;
+	if (filePath === undefined) {
+		return null;
+	}
 	const contents = maybeGetFile(filePath);
-	if (contents === undefined) return null;
+	if (contents === undefined) {
+		return null;
+	}
 
 	// Find the last source mapping URL if any
 	const mapRegexp = /# sourceMappingURL=(.+)/g;
 	const matches = [...contents.matchAll(mapRegexp)];
 	// If we couldn't find a source mapping URL, there's nothing we can do
-	if (matches.length === 0) return null;
+	if (matches.length === 0) {
+		return null;
+	}
 	const mapMatch = matches[matches.length - 1];
 
 	// Get the source map
@@ -45,7 +41,9 @@ export function maybeRetrieveFileSourceMap(
 		return { map, url: fileUrl.href };
 	} else {
 		const map = maybeGetFile(mapUrl);
-		if (map === undefined) return null;
+		if (map === undefined) {
+			return null;
+		}
 		return { map, url: mapUrl.href };
 	}
 }
@@ -101,7 +99,9 @@ export function getSourceMappedStack(
 	const callFrames = details.stackTrace?.callFrames;
 	// If this exception didn't come with `callFrames`, we can't do any source
 	// mapping without parsing the stack, so just return the description as is
-	if (callFrames === undefined) return description;
+	if (callFrames === undefined) {
+		return description;
+	}
 
 	const nameMessage = details.exception?.description?.split("\n")[0] ?? "";
 	const colonIndex = nameMessage.indexOf(":");
@@ -148,7 +148,9 @@ export function getSourceMappedString(
 	for (let i = 0; i < callSiteLines.length; i++) {
 		// If a call site doesn't have a file name, it's likely invalid, so don't
 		// apply source mapping (see cloudflare/workers-sdk#4668)
-		if (callSites[i].getFileName() === undefined) continue;
+		if (callSites[i].getFileName() === undefined) {
+			continue;
+		}
 
 		const callSiteLine = callSiteLines[i][0];
 		const callSiteAtIndex = callSiteLine.indexOf("at");
@@ -201,7 +203,9 @@ function lineMatchToCallSite(lineMatch: RegExpMatchArray): CallSite {
 	if (lineMatch[1]) {
 		functionName = lineMatch[1];
 		let methodStart = functionName.lastIndexOf(".");
-		if (functionName[methodStart - 1] == ".") methodStart--;
+		if (functionName[methodStart - 1] == ".") {
+			methodStart--;
+		}
 		if (methodStart > 0) {
 			object = functionName.substring(0, methodStart);
 			method = functionName.substring(methodStart + 1);
@@ -227,18 +231,18 @@ function lineMatchToCallSite(lineMatch: RegExpMatchArray): CallSite {
 		typeName,
 		functionName,
 		methodName,
-		fileName: lineMatch[2] || null,
+		fileName: lineMatch[2],
 		lineNumber: parseInt(lineMatch[3]) || null,
 		columnNumber: parseInt(lineMatch[4]) || null,
 		native: isNative,
 	});
 }
 
-export interface CallSiteOptions {
+interface CallSiteOptions {
 	typeName: string | null;
 	functionName: string | null;
 	methodName: string | null;
-	fileName: string | null;
+	fileName: string;
 	lineNumber: number | null;
 	columnNumber: number | null;
 	native: boolean;
@@ -247,16 +251,27 @@ export interface CallSiteOptions {
 // https://v8.dev/docs/stack-trace-api#customizing-stack-traces
 // This class supports the subset of options implemented by `node-stack-trace`:
 // https://github.com/felixge/node-stack-trace/blob/4c41a4526e74470179b3b6dd5d75191ca8c56c17/index.js
-export class CallSite implements NodeJS.CallSite {
+class CallSite implements NodeJS.CallSite {
 	constructor(private readonly opts: CallSiteOptions) {}
-
+	getScriptHash(): string {
+		throw new Error("Method not implemented.");
+	}
+	getEnclosingColumnNumber(): number {
+		throw new Error("Method not implemented.");
+	}
+	getEnclosingLineNumber(): number {
+		throw new Error("Method not implemented.");
+	}
+	getPosition(): number {
+		throw new Error("Method not implemented.");
+	}
 	getThis(): unknown {
 		return null;
 	}
 	getTypeName(): string | null {
 		return this.opts.typeName;
 	}
-	// eslint-disable-next-line @typescript-eslint/ban-types
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 	getFunction(): Function | undefined {
 		return undefined;
 	}
@@ -266,10 +281,10 @@ export class CallSite implements NodeJS.CallSite {
 	getMethodName(): string | null {
 		return this.opts.methodName;
 	}
-	getFileName(): string | undefined {
-		return this.opts.fileName ?? undefined;
+	getFileName(): string | null {
+		return this.opts.fileName ?? null;
 	}
-	getScriptNameOrSourceURL(): string | null {
+	getScriptNameOrSourceURL(): string {
 		return this.opts.fileName;
 	}
 	getLineNumber(): number | null {

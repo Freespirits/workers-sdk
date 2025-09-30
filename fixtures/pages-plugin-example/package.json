@@ -1,5 +1,5 @@
 {
-	"name": "pages-plugin-example",
+	"name": "@fixture/pages-plugin",
 	"private": true,
 	"main": "dist/index.js",
 	"types": "index.d.ts",
@@ -10,10 +10,15 @@
 		"public/"
 	],
 	"scripts": {
-		"build": "wrangler pages functions build --plugin --outdir=dist",
+		"build": "wrangler pages functions build --plugin --outdir=dist --external=is-odd",
 		"check:type": "tsc"
 	},
 	"devDependencies": {
+		"@cloudflare/workers-types": "catalog:default",
+		"is-odd": "^3.0.1",
 		"wrangler": "workspace:*"
+	},
+	"volta": {
+		"extends": "../../package.json"
 	}
 }

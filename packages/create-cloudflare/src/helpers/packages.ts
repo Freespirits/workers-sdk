@@ -1,10 +1,12 @@
+import assert from "assert";
 import { existsSync } from "fs";
 import path from "path";
 import { brandColor, dim } from "@cloudflare/cli/colors";
 import { fetch } from "undici";
 import { runCommand } from "./command";
+import { readJSON, writeJSON } from "./files";
 import { detectPackageManager } from "./packageManagers";
-import type { C3Context } from "types";
+import type { C3Context, PackageJson } from "types";
 
 type InstallConfig = {
 	startText?: string;
@@ -22,8 +24,12 @@ type InstallConfig = {
  */
 export const installPackages = async (
 	packages: string[],
-	config: InstallConfig = {}
+	config: InstallConfig = {},
 ) => {
+	if (packages.length === 0) {
+		return;
+	}
+
 	const { npm } = detectPackageManager();
 
 	let saveFlag;
@@ -45,10 +51,44 @@ export const installPackages = async (
 			break;
 	}
 
-	await runCommand([npm, cmd, ...(saveFlag ? [saveFlag] : []), ...packages], {
-		...config,
-		silent: true,
-	});
+	await runCommand(
+		[
+			npm,
+			cmd,
+			...(saveFlag ? [saveFlag] : []),
+			...packages,
+			// Add --legacy-peer-deps so that installing Wrangler v4 doesn't case issues with
+			// frameworks that haven't updated their peer dependency for Wrangler v4
+			// TODO: Remove this once Wrangler v4 has been released and framework templates are updated
+			...(npm === "npm" ? ["--legacy-peer-deps"] : []),
+		],
+		{
+			...config,
+			silent: true,
+		},
+	);
+
+	if (npm === "npm") {
+		// Npm install will update the package.json with a caret-range rather than the exact version/range we asked for.
+		// We can't use `npm install --save-exact` because that always pins to an exact version, and we want to allow ranges too.
+		// So let's just fix that up now by rewriting the package.json.
+		const pkgJsonPath = path.join(process.cwd(), "package.json");
+		const pkgJson = readJSON(pkgJsonPath) as PackageJson;
+		const deps = config.dev ? pkgJson.devDependencies : pkgJson.dependencies;
+		assert(deps, "dependencies should be defined");
+		for (const pkg of packages) {
+			const versionMarker = pkg.lastIndexOf("@");
+			if (versionMarker > 0) {
+				// (if versionMarker was 0 then this would indicate a scoped package with no version)
+				const pkgName = pkg.slice(0, versionMarker);
+				const pkgVersion = pkg.slice(versionMarker + 1);
+				if (pkgVersion !== "latest") {
+					deps[pkgName] = pkgVersion;
+				}
+			}
+		}
+		writeJSON(pkgJsonPath, pkgJson);
+	}
 };
 
 /**
@@ -63,11 +103,17 @@ export const npmInstall = async (ctx: C3Context) => {
 
 	const { npm } = detectPackageManager();
 
-	await runCommand([npm, "install"], {
-		silent: true,
-		startText: "Installing dependencies",
-		doneText: `${brandColor("installed")} ${dim(`via \`${npm} install\``)}`,
-	});
+	await runCommand(
+		// Add --legacy-peer-deps so that installing Wrangler v4 doesn't case issues with
+		// frameworks that haven't updated their peer dependency for Wrangler v4
+		// TODO: Remove this once Wrangler v4 has been released and framework templates are updated
+		[npm, "install", ...(npm === "npm" ? ["--legacy-peer-deps"] : [])],
+		{
+			silent: true,
+			startText: "Installing dependencies",
+			doneText: `${brandColor("installed")} ${dim(`via \`${npm} install\``)}`,
+		},
+	);
 };
 
 type NpmInfoResponse = {
@@ -89,18 +135,14 @@ export async function getLatestPackageVersion(packageSpecifier: string) {
 export const installWrangler = async () => {
 	const { npm } = detectPackageManager();
 
-	// Exit early if already installed
-	if (existsSync(path.resolve("node_modules", "wrangler"))) {
-		return;
-	}
-
-	await installPackages([`wrangler`], {
+	// Even if Wrangler is already installed, make sure we install the latest version, as some framework CLIs are pinned to an older version
+	await installPackages([`wrangler@latest`], {
 		dev: true,
 		startText: `Installing wrangler ${dim(
-			"A command line tool for building Cloudflare Workers"
+			"A command line tool for building Cloudflare Workers",
 		)}`,
 		doneText: `${brandColor("installed")} ${dim(
-			`via \`${npm} install wrangler --save-dev\``
+			`via \`${npm} install wrangler --save-dev\``,
 		)}`,
 	});
 };

@@ -2,6 +2,7 @@ import { brandColor, dim } from "@cloudflare/cli/colors";
 import { inputPrompt, spinner } from "@cloudflare/cli/interactive";
 import { runCommand } from "helpers/command";
 import { detectPackageManager } from "helpers/packageManagers";
+import { reporter } from "../metrics";
 import type { C3Context } from "types";
 
 export const chooseAccount = async (ctx: C3Context) => {
@@ -11,19 +12,24 @@ export const chooseAccount = async (ctx: C3Context) => {
 
 	let accountId: string;
 
-	if (Object.keys(accounts).length == 1) {
+	const numAccounts = Object.keys(accounts).length;
+	if (numAccounts === 0) {
+		throw new Error(
+			"Unable to find any accounts to deploy to! Please ensure you're logged in as a user that can deploy Workers.",
+		);
+	} else if (numAccounts === 1) {
 		const accountName = Object.keys(accounts)[0];
 		accountId = accounts[accountName];
 		s.stop(`${brandColor("account")} ${dim(accountName)}`);
 	} else {
 		s.stop(
-			`${brandColor("account")} ${dim("more than one account available")}`
+			`${brandColor("account")} ${dim("more than one account available")}`,
 		);
 		const accountOptions = Object.entries(accounts).map(
 			([accountName, id]) => ({
 				label: accountName,
 				value: id,
-			})
+			}),
 		);
 
 		accountId = await inputPrompt({
@@ -35,34 +41,53 @@ export const chooseAccount = async (ctx: C3Context) => {
 		});
 	}
 	const accountName = Object.keys(accounts).find(
-		(account) => accounts[account] == accountId
+		(account) => accounts[account] == accountId,
 	) as string;
 
 	ctx.account = { id: accountId, name: accountName };
 };
 
-export const wranglerLogin = async () => {
-	const { npx } = detectPackageManager();
+export const wranglerLogin = async (ctx: C3Context) => {
+	return reporter.collectAsyncMetrics({
+		eventPrefix: "c3 login",
+		props: {
+			args: ctx.args,
+		},
+		async promise() {
+			const { npx } = detectPackageManager();
 
-	const s = spinner();
-	s.start(`Logging into Cloudflare ${dim("checking authentication status")}`);
-	const alreadyLoggedIn = await isLoggedIn();
-	s.stop(brandColor(alreadyLoggedIn ? "logged in" : "not logged in"));
-	if (alreadyLoggedIn) return true;
+			const s = spinner();
+			s.start(
+				`Logging into Cloudflare ${dim("checking authentication status")}`,
+			);
+			const isAlreadyLoggedIn = await isLoggedIn();
+			s.stop(brandColor(isAlreadyLoggedIn ? "logged in" : "not logged in"));
 
-	s.start(`Logging into Cloudflare ${dim("This will open a browser window")}`);
+			reporter.setEventProperty("isAlreadyLoggedIn", isAlreadyLoggedIn);
 
-	// We're using a custom spinner since this is a little complicated.
-	// We want to vary the done status based on the output
-	const output = await runCommand([npx, "wrangler", "login"], {
-		silent: true,
+			if (isAlreadyLoggedIn) {
+				return true;
+			}
+
+			s.start(
+				`Logging into Cloudflare ${dim("This will open a browser window")}`,
+			);
+
+			// We're using a custom spinner since this is a little complicated.
+			// We want to vary the done status based on the output
+			const output = await runCommand([npx, "wrangler", "login"], {
+				silent: true,
+			});
+			const success = /Successfully logged in/.test(output);
+
+			const verb = success ? "allowed" : "denied";
+			s.stop(`${brandColor(verb)} ${dim("via `wrangler login`")}`);
+
+			reporter.setEventProperty("isLoginSuccessful", success);
+
+			return success;
+		},
 	});
-	const success = /Successfully logged in/.test(output);
-
-	const verb = success ? "allowed" : "denied";
-	s.stop(`${brandColor(verb)} ${dim("via `wrangler login`")}`);
-
-	return success;
 };
 
 export const listAccounts = async () => {
@@ -90,7 +115,7 @@ export const isLoggedIn = async () => {
 			silent: true,
 		});
 		return /You are logged in/.test(output);
-	} catch (error) {
+	} catch {
 		return false;
 	}
 };

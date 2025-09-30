@@ -1,6 +1,8 @@
 import { mockPackageManager, mockSpinner } from "helpers/__tests__/mocks";
 import { runCommand } from "helpers/command";
+import { hasSparrowSourceKey } from "helpers/sparrow";
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { createTestContext } from "../../__tests__/helpers";
 import { isLoggedIn, listAccounts, wranglerLogin } from "../accounts";
 
 const loggedInWhoamiOutput = `
@@ -29,14 +31,19 @@ Successfully logged in.
 `;
 
 vi.mock("helpers/command");
+vi.mock("helpers/sparrow");
 vi.mock("which-pm-runs");
 vi.mock("@cloudflare/cli/interactive");
 
 describe("wrangler account helpers", () => {
+	const ctx = createTestContext();
+
 	let spinner: ReturnType<typeof mockSpinner>;
 
 	beforeEach(() => {
 		mockPackageManager("npm");
+		vi.mocked(hasSparrowSourceKey).mockReturnValue(true);
+
 		spinner = mockSpinner();
 	});
 
@@ -46,16 +53,16 @@ describe("wrangler account helpers", () => {
 				.mocked(runCommand)
 				.mockReturnValueOnce(Promise.resolve(loggedInWhoamiOutput));
 
-			const loggedIn = await wranglerLogin();
+			const loggedIn = await wranglerLogin(ctx);
 
 			expect(loggedIn).toBe(true);
 			expect(mock).toHaveBeenCalledWith(
 				["npx", "wrangler", "whoami"],
-				expect.anything()
+				expect.anything(),
 			);
 			expect(mock).not.toHaveBeenCalledWith(
 				["npx", "wrangler", "login"],
-				expect.anything()
+				expect.anything(),
 			);
 			expect(spinner.start).toHaveBeenCalledOnce();
 			expect(spinner.stop).toHaveBeenCalledOnce();
@@ -67,16 +74,16 @@ describe("wrangler account helpers", () => {
 				.mockReturnValueOnce(Promise.resolve(loggedOutWhoamiOutput))
 				.mockReturnValueOnce(Promise.resolve(loginSuccessOutput));
 
-			const loggedIn = await wranglerLogin();
+			const loggedIn = await wranglerLogin(ctx);
 
 			expect(loggedIn).toBe(true);
 			expect(mock).toHaveBeenCalledWith(
 				["npx", "wrangler", "whoami"],
-				expect.anything()
+				expect.anything(),
 			);
 			expect(mock).toHaveBeenCalledWith(
 				["npx", "wrangler", "login"],
-				expect.anything()
+				expect.anything(),
 			);
 			expect(spinner.start).toHaveBeenCalledTimes(2);
 			expect(spinner.stop).toHaveBeenCalledTimes(2);
@@ -88,16 +95,16 @@ describe("wrangler account helpers", () => {
 				.mockReturnValueOnce(Promise.resolve(loggedOutWhoamiOutput))
 				.mockReturnValueOnce(Promise.resolve(loginDeniedOutput));
 
-			const loggedIn = await wranglerLogin();
+			const loggedIn = await wranglerLogin(ctx);
 
 			expect(loggedIn).toBe(false);
 			expect(mock).toHaveBeenCalledWith(
 				["npx", "wrangler", "whoami"],
-				expect.anything()
+				expect.anything(),
 			);
 			expect(mock).toHaveBeenCalledWith(
 				["npx", "wrangler", "login"],
-				expect.anything()
+				expect.anything(),
 			);
 			expect(spinner.start).toHaveBeenCalledTimes(2);
 			expect(spinner.stop).toHaveBeenCalledTimes(2);
@@ -113,7 +120,7 @@ describe("wrangler account helpers", () => {
 		expect(accounts).keys("testacct");
 		expect(mock).toHaveBeenLastCalledWith(
 			["npx", "wrangler", "whoami"],
-			expect.anything()
+			expect.anything(),
 		);
 	});
 
@@ -128,7 +135,7 @@ describe("wrangler account helpers", () => {
 			expect(result).toBe(true);
 			expect(mock).toHaveBeenLastCalledWith(
 				["npx", "wrangler", "whoami"],
-				expect.anything()
+				expect.anything(),
 			);
 		});
 
@@ -142,7 +149,7 @@ describe("wrangler account helpers", () => {
 			expect(result).toBe(false);
 			expect(mock).toHaveBeenLastCalledWith(
 				["npx", "wrangler", "whoami"],
-				expect.anything()
+				expect.anything(),
 			);
 		});
 
@@ -156,7 +163,7 @@ describe("wrangler account helpers", () => {
 			expect(result).toBe(false);
 			expect(mock).toHaveBeenLastCalledWith(
 				["npx", "wrangler", "whoami"],
-				expect.anything()
+				expect.anything(),
 			);
 		});
 	});

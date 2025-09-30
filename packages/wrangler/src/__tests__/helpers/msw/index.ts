@@ -8,13 +8,14 @@ import {
 } from "./handlers/deployments";
 import { mswSuccessNamespacesHandlers } from "./handlers/namespaces";
 import { mswSuccessOauthHandlers } from "./handlers/oauth";
-import { mswSuccessR2handlers } from "./handlers/r2";
+import { mswR2handlers } from "./handlers/r2";
 import { default as mswSucessScriptHandlers } from "./handlers/script";
 import { mswSuccessUserHandlers } from "./handlers/user";
 import {
 	mswGetVersion,
 	mswListNewDeployments,
 	mswListVersions,
+	mswPatchNonVersionedScriptSettings,
 	mswPostNewDeployment,
 } from "./handlers/versions";
 import { default as mswZoneHandlers } from "./handlers/zones";
@@ -35,19 +36,19 @@ function createFetchResult(
 				errors,
 				messages,
 				result_info,
-		  }
+			}
 		: {
 				result,
 				success,
 				errors,
 				messages,
-		  };
+			};
 }
 
 export {
 	createFetchResult,
 	mswSuccessUserHandlers,
-	mswSuccessR2handlers,
+	mswR2handlers,
 	mswSuccessOauthHandlers,
 	mswSuccessNamespacesHandlers,
 	mswSucessScriptHandlers,
@@ -61,4 +62,5 @@ export {
 	mswGetVersion,
 	mswListNewDeployments,
 	mswListVersions,
+	mswPatchNonVersionedScriptSettings,
 };

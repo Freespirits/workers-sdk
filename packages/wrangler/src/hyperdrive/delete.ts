@@ -1,28 +1,24 @@
-import { readConfig } from "../config";
+import { createCommand } from "../core/create-command";
 import { logger } from "../logger";
 import { deleteConfig } from "./client";
-import { hyperdriveBetaWarning } from "./utils";
-import type {
-	CommonYargsArgv,
-	StrictYargsOptionsToInterface,
-} from "../yargs-types";
 
-export function options(yargs: CommonYargsArgv) {
-	return yargs
-		.positional("id", {
+export const hyperdriveDeleteCommand = createCommand({
+	metadata: {
+		description: "Delete a Hyperdrive config",
+		status: "stable",
+		owner: "Product: Hyperdrive",
+	},
+	args: {
+		id: {
 			type: "string",
 			demandOption: true,
 			description: "The ID of the Hyperdrive config",
-		})
-		.epilogue(hyperdriveBetaWarning);
-}
-
-export async function handler(
-	args: StrictYargsOptionsToInterface<typeof options>
-) {
-	const config = readConfig(args.config, args);
-
-	logger.log(`🗑️ Deleting Hyperdrive database config ${args.id}`);
-	await deleteConfig(config, args.id);
-	logger.log(`✅ Deleted`);
-}
+		},
+	},
+	positionalArgs: ["id"],
+	async handler({ id }, { config }) {
+		logger.log(`🗑️ Deleting Hyperdrive database config ${id}`);
+		await deleteConfig(config, id);
+		logger.log(`✅ Deleted`);
+	},
+});

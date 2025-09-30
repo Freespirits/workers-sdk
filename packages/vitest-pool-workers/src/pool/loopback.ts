@@ -9,6 +9,7 @@ import {
 	Mutex,
 	R2_PLUGIN_NAME,
 	Response,
+	WORKFLOWS_PLUGIN_NAME,
 } from "miniflare";
 import { isFileNotFoundError, WORKER_NAME_PREFIX } from "./helpers";
 import type { Awaitable, Miniflare, Request, WorkerOptions } from "miniflare";
@@ -19,7 +20,9 @@ async function handleSnapshotRequest(
 	url: URL
 ): Promise<Response> {
 	const filePath = url.searchParams.get("path");
-	if (filePath === null) return new Response(null, { status: 400 });
+	if (filePath === null) {
+		return new Response(null, { status: 400 });
+	}
 
 	if (request.method === "POST" /* prepareDirectory */) {
 		await fs.mkdir(filePath, { recursive: true });
@@ -37,7 +40,9 @@ async function handleSnapshotRequest(
 		try {
 			return new Response(await fs.readFile(filePath));
 		} catch (e) {
-			if (!isFileNotFoundError(e)) throw e;
+			if (!isFileNotFoundError(e)) {
+				throw e;
+			}
 			return new Response(null, { status: 404 });
 		}
 	}
@@ -46,7 +51,9 @@ async function handleSnapshotRequest(
 		try {
 			await fs.unlink(filePath);
 		} catch (e) {
-			if (!isFileNotFoundError(e)) throw e;
+			if (!isFileNotFoundError(e)) {
+				throw e;
+			}
 		}
 		return new Response(null, { status: 204 });
 	}
@@ -59,12 +66,27 @@ async function emptyDir(dirPath: string) {
 	try {
 		names = await fs.readdir(dirPath);
 	} catch (e) {
-		if (isFileNotFoundError(e)) return;
+		if (isFileNotFoundError(e)) {
+			return;
+		}
 		throw e;
 	}
 	for (const name of names) {
-		await fs.rm(path.join(dirPath, name), { recursive: true, force: true });
+		try {
+			await fs.rm(path.join(dirPath, name), { recursive: true, force: true });
+		} catch (e) {
+			if (isEbusyError(e)) {
+				// Sometimes workerd holds on to file handles in Windows, preventing us from cleaning up these.
+				console.warn(
+					`vitest-pool-worker: Unable to remove temporary directory: ${e}`
+				);
+			}
+		}
 	}
+}
+
+function isEbusyError(e: unknown): boolean {
+	return e instanceof Error && "code" in e && e.code === "EBUSY";
 }
 
 /**
@@ -231,7 +253,9 @@ async function pushStackedStorage(intoDepth: number, persistPath: string) {
 	// For each Durable Object unique key in the persistence path...
 	for (const key of await fs.readdir(persistPath, { withFileTypes: true })) {
 		// (skipping stack directory)
-		if (key.name === STACK_DIR_NAME) continue;
+		if (key.name === STACK_DIR_NAME) {
+			continue;
+		}
 		const keyPath = path.join(persistPath, key.name);
 		const stackFrameKeyPath = path.join(stackFramePath, key.name);
 		assert(key.isDirectory(), `Expected ${keyPath} to be a directory`);
@@ -239,7 +263,9 @@ async function pushStackedStorage(intoDepth: number, persistPath: string) {
 		let createdStackFrameKeyPath = false;
 		for (const name of await fs.readdir(keyPath)) {
 			// If this is a blobs directory, it shouldn't contain any `.sqlite` files
-			if (name === BLOBS_DIR_NAME) break;
+			if (name === BLOBS_DIR_NAME) {
+				break;
+			}
 			if (!createdStackFrameKeyPath) {
 				createdStackFrameKeyPath = true;
 				await fs.mkdir(stackFrameKeyPath);
@@ -255,13 +281,18 @@ async function popStackedStorage(fromDepth: number, persistPath: string) {
 	// Delete every Durable Object unique key directory in the persistence path
 	for (const key of await fs.readdir(persistPath, { withFileTypes: true })) {
 		// (skipping stack directory)
-		if (key.name === STACK_DIR_NAME) continue;
+		if (key.name === STACK_DIR_NAME) {
+			continue;
+		}
 		const keyPath = path.join(persistPath, key.name);
 		for (const name of await fs.readdir(keyPath)) {
 			// If this is a blobs directory, it shouldn't contain any `.sqlite` files
-			if (name === BLOBS_DIR_NAME) break;
+			if (name === BLOBS_DIR_NAME) {
+				break;
+			}
 			const namePath = path.join(keyPath, name);
 			assert(name.endsWith(".sqlite"), `Expected .sqlite, got ${namePath}`);
+
 			await fs.unlink(namePath);
 		}
 	}
@@ -284,6 +315,7 @@ const PLUGIN_PRODUCT_NAMES: Record<string, string | undefined> = {
 	[DURABLE_OBJECTS_PLUGIN_NAME]: "Durable Objects",
 	[KV_PLUGIN_NAME]: "KV",
 	[R2_PLUGIN_NAME]: "R2",
+	[WORKFLOWS_PLUGIN_NAME]: "Workflows",
 };
 const LIST_FORMAT = new Intl.ListFormat("en-US");
 
@@ -310,14 +342,30 @@ function checkAllStorageOperationsResolved(
 			"",
 			separator,
 			`Failed to ${action} isolated storage stack frame in ${source}.`,
-			"This usually means your Worker tried to access storage outside of a test.",
-			`In particular, we were unable to ${action} ${LIST_FORMAT.format(
-				failedProducts
-			)} storage.`,
-			"Ensure you `await` all `Promise`s that read or write to these services.",
+			`In particular, we were unable to ${action} ${LIST_FORMAT.format(failedProducts)} storage.`,
+			"This usually means your Worker tried to access storage outside of a test, or some resources have not been disposed of properly.",
+			`Ensure you "await" all Promises that read or write to these services, and make sure you use the "using" keyword when passing data across JSRPC.`,
+			`See https://developers.cloudflare.com/workers/testing/vitest-integration/known-issues/#isolated-storage for more details.`,
 			"\x1b[2m"
 		);
 		lines.push("\x1b[22m" + separator, "");
+
+		if (
+			failedProducts.includes(
+				PLUGIN_PRODUCT_NAMES[WORKFLOWS_PLUGIN_NAME] ?? WORKFLOWS_PLUGIN_NAME
+			)
+		) {
+			console.warn(
+				[
+					"",
+					separator,
+					`Workflows are being created in ${source}.`,
+					"Even with isolated storage, Workflows are required to be manually disposed at the end of each test.",
+					"See https://developers.cloudflare.com/workers/testing/vitest-integration/test-apis/ for more details.",
+					"",
+				].join("\n")
+			);
+		}
 		console.error(lines.join("\n"));
 		return false;
 	}
@@ -394,10 +442,14 @@ export async function handleDurableObjectsRequest(
 	mf: Miniflare,
 	url: URL
 ): Promise<Response> {
-	if (request.method !== "GET") return new Response(null, { status: 405 });
+	if (request.method !== "GET") {
+		return new Response(null, { status: 405 });
+	}
 	const { durableObjectPersistPath } = getState(mf);
 	const uniqueKey = url.searchParams.get("unique_key");
-	if (uniqueKey === null) return new Response(null, { status: 400 });
+	if (uniqueKey === null) {
+		return new Response(null, { status: 400 });
+	}
 	const namespacePath = path.join(durableObjectPersistPath, uniqueKey);
 
 	const ids: string[] = [];
@@ -409,7 +461,9 @@ export async function handleDurableObjectsRequest(
 			}
 		}
 	} catch (e) {
-		if (!isFileNotFoundError(e)) throw e;
+		if (!isFileNotFoundError(e)) {
+			throw e;
+		}
 	}
 	return Response.json(ids);
 }
@@ -419,8 +473,12 @@ export function handleLoopbackRequest(
 	mf: Miniflare
 ): Awaitable<Response> {
 	const url = new URL(request.url);
-	if (url.pathname === "/snapshot") return handleSnapshotRequest(request, url);
-	if (url.pathname === "/storage") return handleStorageRequest(request, mf);
+	if (url.pathname === "/snapshot") {
+		return handleSnapshotRequest(request, url);
+	}
+	if (url.pathname === "/storage") {
+		return handleStorageRequest(request, mf);
+	}
 	if (url.pathname === "/durable-objects") {
 		return handleDurableObjectsRequest(request, mf, url);
 	}

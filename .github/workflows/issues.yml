@@ -2,7 +2,11 @@ name: Add issues to DevProd project
 
 on:
   issues:
-    types: [opened, labeled, unlabeled, transferred]
+    types: [opened, transferred]
+
+permissions:
+  # issues:write permission needed so that the workflow can manage issues
+  issues: write
 
 jobs:
   add-to-project:

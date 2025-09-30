@@ -1,13 +1,13 @@
 import fs from "node:fs";
 import path from "path";
+import { configFileName } from "../../config";
 import { confirm } from "../../dialogs";
 import { UserError } from "../../errors";
-import { CI } from "../../is-ci";
-import isInteractive from "../../is-interactive";
+import { isNonInteractiveOrCI } from "../../is-interactive";
 import { logger } from "../../logger";
-import { DEFAULT_BATCH_SIZE, DEFAULT_MIGRATION_PATH } from "../constants";
+import { DEFAULT_MIGRATION_PATH } from "../constants";
 import { executeSql } from "../execute";
-import type { ConfigFields, DevConfig, Environment } from "../../config";
+import type { Config } from "../../config";
 import type { QueryResult } from "../execute";
 import type { Migration } from "../types";
 
@@ -15,17 +15,21 @@ export async function getMigrationsPath({
 	projectPath,
 	migrationsFolderPath,
 	createIfMissing,
+	configPath,
 }: {
 	projectPath: string;
 	migrationsFolderPath: string;
 	createIfMissing: boolean;
+	configPath: string | undefined;
 }): Promise<string> {
 	const dir = path.resolve(projectPath, migrationsFolderPath);
-	if (fs.existsSync(dir)) return dir;
+	if (fs.existsSync(dir)) {
+		return dir;
+	}
 
 	const warning = `No migrations folder found.${
 		migrationsFolderPath === DEFAULT_MIGRATION_PATH
-			? " Set `migrations_dir` in wrangler.toml to choose a different path."
+			? ` Set \`migrations_dir\` in your ${configFileName(configPath)} file to choose a different path.`
 			: ""
 	}`;
 
@@ -53,7 +57,7 @@ export async function getUnappliedMigrations({
 	migrationsPath: string;
 	local: boolean | undefined;
 	remote: boolean | undefined;
-	config: ConfigFields<DevConfig> & Environment;
+	config: Config;
 	name: string;
 	persistTo: string | undefined;
 	preview: boolean | undefined;
@@ -88,7 +92,7 @@ type ListAppliedMigrationsProps = {
 	migrationsTableName: string;
 	local: boolean | undefined;
 	remote: boolean | undefined;
-	config: ConfigFields<DevConfig> & Environment;
+	config: Config;
 	name: string;
 	persistTo: string | undefined;
 	preview: boolean | undefined;
@@ -108,7 +112,7 @@ const listAppliedMigrations = async ({
 		remote,
 		config,
 		name,
-		shouldPrompt: isInteractive() && !CI.isCI(),
+		shouldPrompt: !isNonInteractiveOrCI(),
 		persistTo,
 		command: `SELECT *
 		FROM ${migrationsTableName}
@@ -116,10 +120,11 @@ const listAppliedMigrations = async ({
 		file: undefined,
 		json: true,
 		preview,
-		batchSize: DEFAULT_BATCH_SIZE,
 	});
 
-	if (!response || response[0].results.length === 0) return [];
+	if (!response || response[0].results.length === 0) {
+		return [];
+	}
 
 	return response[0].results as Migration[];
 };
@@ -131,7 +136,9 @@ function getMigrationNames(migrationsPath: string): Array<string> {
 
 	let dirent;
 	while ((dirent = dir.readSync()) !== null) {
-		if (dirent.name.endsWith(".sql")) migrations.push(dirent.name);
+		if (dirent.name.endsWith(".sql")) {
+			migrations.push(dirent.name);
+		}
 	}
 
 	dir.closeSync();
@@ -163,7 +170,7 @@ export const initMigrationsTable = async ({
 	migrationsTableName: string;
 	local: boolean | undefined;
 	remote: boolean | undefined;
-	config: ConfigFields<DevConfig> & Environment;
+	config: Config;
 	name: string;
 	persistTo: string | undefined;
 	preview: boolean | undefined;
@@ -173,7 +180,7 @@ export const initMigrationsTable = async ({
 		remote,
 		config,
 		name,
-		shouldPrompt: isInteractive() && !CI.isCI(),
+		shouldPrompt: !isNonInteractiveOrCI(),
 		persistTo,
 		command: `CREATE TABLE IF NOT EXISTS ${migrationsTableName}(
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,6 +190,5 @@ export const initMigrationsTable = async ({
 		file: undefined,
 		json: true,
 		preview,
-		batchSize: DEFAULT_BATCH_SIZE,
 	});
 };

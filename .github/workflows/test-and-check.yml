@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  merge_group:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  add-to-project:
+    if: github.head_ref != 'changeset-release/main'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-add-pr
+      cancel-in-progress: true
+    timeout-minutes: 30
+    name: Add PR to project
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -X POST https://devprod-status-bot.devprod.workers.dev/pr-project/workers-sdk/${{ github.event.number }}
+
+  check:
+    timeout-minutes: 30
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}-checks
+      cancel-in-progress: true
+
+    name: "Checks"
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        uses: ./.github/actions/install-dependencies
+        with:
+          turbo-api: ${{ secrets.TURBO_API }}
+          turbo-team: ${{ secrets.TURBO_TEAM }}
+          turbo-token: ${{ secrets.TURBO_TOKEN }}
+          turbo-signature: ${{ secrets.TURBO_REMOTE_CACHE_SIGNATURE_KEY }}
+
+      - name: Check the changesets
+        run: node -r esbuild-register tools/deployments/validate-changesets.ts
+
+      - name: Bump package versions
+        run: node .github/changeset-version.js
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Check for errors
+        run: pnpm run check --summarize
+        env:
+          CI_OS: ${{ runner.os }}
+          NODE_OPTIONS: "--max_old_space_size=8192"
+
+      - name: Upload turbo logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turbo-runs-${{ matrix.os }}-${{ matrix.node }}
+          path: .turbo/runs
+
+      # Check for old Node.js version warnings and errors
+      - name: Use Node.js v16
+        uses: actions/setup-node@v4
+        with:
+          node-version: 16
+
+      - name: Check for error message on Node.js < v18
+        run: node packages/wrangler/src/__tests__/test-old-node-version.js error
+
+      - name: Use Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Check for error message on Node.js < v20
+        run: node packages/wrangler/src/__tests__/test-old-node-version.js error
+
+  test:
+    timeout-minutes: 45
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}-${{ matrix.filter }}-${{ matrix.node_version }}-test
+      cancel-in-progress: true
+
+    name: ${{ format('Tests ({0})', matrix.description) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            description: macOS
+            node_version: 20.19.1
+            filter: '--filter="./packages/*" --filter="./fixtures/*" --filter="./packages/vite-plugin-cloudflare/playground" --summarize'
+          # needs to run on the amd runners to allow containers test to work in CI
+          - os: ubuntu-24.04
+            description: Linux
+            node_version: 20.19.1
+            # ./tools _only_ runs here because they're only intended to run in CI
+            # Browser rendering is disabled here because of https://pptr.dev/troubleshooting#issues-with-apparmor-on-ubuntu
+            filter: '--filter="./tools" --filter="./packages/*" --filter="./fixtures/*" --filter="./packages/vite-plugin-cloudflare/playground" --filter="!./fixtures/browser-rendering"'
+          - os: windows-latest
+            description: Windows
+            node_version: 20.19.1
+            filter: '--filter="./packages/*" --filter="./fixtures/*" --filter="./packages/vite-plugin-cloudflare/playground"'
+          # needs to run on the amd runners to allow containers test to work in CI
+          - os: ubuntu-24.04
+            description: v22, Linux
+            node_version: 22
+            # Browser rendering is disabled here because of https://pptr.dev/troubleshooting#issues-with-apparmor-on-ubuntu
+            filter: '--filter="./packages/*" --filter="./fixtures/*" --filter="./packages/vite-plugin-cloudflare/playground" --filter="!./packages/kv-asset-handler" --filter="!./fixtures/browser-rendering"'
+          # Skipped until we upgrade to undici v7, because of https://github.com/nodejs/undici/issues/4285
+          # - os: ubuntu-24.04
+          #   label: v24, Linux
+          #   node_version: 24
+          #   filter: '--filter="./packages/*" --filter="./fixtures/*" --filter="./packages/vite-plugin-cloudflare/playground" --filter="!./packages/kv-asset-handler" --filter="!./fixtures/interactive-dev-tests"'
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            everything_but_markdown:
+              - '!**/*.md'
+
+      - name: Install Dependencies
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        uses: ./.github/actions/install-dependencies
+        with:
+          turbo-api: ${{ secrets.TURBO_API }}
+          turbo-team: ${{ secrets.TURBO_TEAM }}
+          turbo-token: ${{ secrets.TURBO_TOKEN }}
+          turbo-signature: ${{ secrets.TURBO_REMOTE_CACHE_SIGNATURE_KEY }}
+          node-version: ${{ matrix.node_version }}
+
+      - name: Bump package versions
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        run: node .github/changeset-version.js
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Run tests (Wrangler only)
+        # We are running Wrangler separately to be able to get early feedback on changes.
+        # There is no point in running the fixtures if Wrangler is broken.
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        run: pnpm run test:ci --log-order=stream --filter=wrangler
+        env:
+          NODE_OPTIONS: "--max_old_space_size=8192"
+          WRANGLER_LOG_PATH: ${{ runner.temp }}/wrangler-debug-logs/
+          TEST_REPORT_PATH: ${{ runner.temp }}/test-report/index.html
+          CI_OS: ${{ matrix.description }}
+          NODE_DEBUG: "@cloudflare:vite-plugin"
+
+      - name: Run tests (not Wrangler)
+        if: steps.changes.outputs.everything_but_markdown == 'true'
+        run: pnpm run test:ci --concurrency 1 ${{ matrix.filter }} --log-order=stream --filter=!wrangler
+        env:
+          NODE_OPTIONS: "--max_old_space_size=8192"
+          WRANGLER_LOG_PATH: ${{ runner.temp }}/wrangler-debug-logs/
+          TEST_REPORT_PATH: ${{ runner.temp }}/test-report/index.html
+          CI_OS: ${{ matrix.description }}
+          NODE_DEBUG: "@cloudflare:vite-plugin"
+
+      - name: Upload turbo logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turbo-runs-${{ matrix.os }}-${{ matrix.node }}
+          path: .turbo/runs

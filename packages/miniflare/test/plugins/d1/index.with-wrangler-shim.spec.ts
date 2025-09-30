@@ -1,11 +1,14 @@
+import { setupTest } from "./test";
 import type {
 	D1Database,
+	D1DatabaseSession,
 	D1ExecResult,
 	D1PreparedStatement,
 	D1Result,
+	D1SessionBookmark,
+	D1SessionConstraint,
 } from "@cloudflare/workers-types/experimental";
 import type { Miniflare } from "miniflare";
-import { setupTest } from "./test";
 
 const kSend = Symbol("kSend");
 
@@ -41,6 +44,13 @@ export class TestD1Database implements D1Database {
 
 	async exec(query: string): Promise<D1ExecResult> {
 		return this[kSend]("/exec", query);
+	}
+
+	withSession(
+		// eslint-disable-next-line @typescript-eslint/no-unused-vars
+		constraintOrBookmark?: D1SessionBookmark | D1SessionConstraint
+	): D1DatabaseSession {
+		throw new Error("Method not implemented for D1 Wrangler shim.");
 	}
 }
 
@@ -83,4 +93,6 @@ setupTest(
 	"worker.dist.mjs",
 	async (mf) => new TestD1Database(mf)
 );
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 require("./suite");

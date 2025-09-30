@@ -1,33 +1,31 @@
-import { rest } from "msw";
+import { http, HttpResponse } from "msw";
 import { fetchGraphqlResult } from "../cfetch";
+import { COMPLIANCE_REGION_CONFIG_UNKNOWN } from "../environment-variables/misc-variables";
 import { mockAccountId, mockApiToken } from "./helpers/mock-account-id";
-import { mockOAuthFlow } from "./helpers/mock-oauth-flow";
 import { msw } from "./helpers/msw";
 
 describe("fetchGraphqlResult", () => {
 	mockAccountId({ accountId: null });
 	mockApiToken();
-	const { mockOAuthServerCallback } = mockOAuthFlow();
 
 	it("should make a request against the graphql endpoint by default", async () => {
-		mockOAuthServerCallback();
 		msw.use(
-			rest.post("*/graphql", async (req, res, ctx) => {
-				return res(
-					ctx.status(200),
-					ctx.json({
+			http.post("*/graphql", async () => {
+				return HttpResponse.json(
+					{
 						data: {
 							viewer: {
 								__typename: "viewer",
 							},
 						},
 						errors: null,
-					})
+					},
+					{ status: 200 }
 				);
 			})
 		);
 		expect(
-			await fetchGraphqlResult({
+			await fetchGraphqlResult(COMPLIANCE_REGION_CONFIG_UNKNOWN, {
 				body: JSON.stringify({
 					query: `{
                     viewer {
@@ -40,13 +38,11 @@ describe("fetchGraphqlResult", () => {
 	});
 
 	it("should accept a request with no init, but return no data", async () => {
-		mockOAuthServerCallback();
 		const now = new Date().toISOString();
 		msw.use(
-			rest.post("*/graphql", async (req, res, ctx) => {
-				return res(
-					ctx.status(200),
-					ctx.json({
+			http.post("*/graphql", async () => {
+				return HttpResponse.json(
+					{
 						data: null,
 						errors: [
 							{
@@ -57,11 +53,12 @@ describe("fetchGraphqlResult", () => {
 								},
 							},
 						],
-					})
+					},
+					{ status: 200 }
 				);
 			})
 		);
-		expect(await fetchGraphqlResult()).toEqual({
+		expect(await fetchGraphqlResult(COMPLIANCE_REGION_CONFIG_UNKNOWN)).toEqual({
 			data: null,
 			errors: [
 				{

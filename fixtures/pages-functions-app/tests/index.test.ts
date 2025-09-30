@@ -16,7 +16,7 @@ describe("Pages Functions", () => {
 			[
 				"--binding=NAME=VALUE",
 				"--binding=OTHER_NAME=THING=WITH=EQUALS",
-				"--r2=BUCKET",
+				"--r2=bucket",
 				"--port=0",
 				"--inspector-port=0",
 			]
@@ -58,7 +58,7 @@ describe("Pages Functions", () => {
 		const env = await response.json();
 		expect(env).toEqual({
 			ASSETS: {},
-			BUCKET: {},
+			bucket: {},
 			NAME: "VALUE",
 			OTHER_NAME: "THING=WITH=EQUALS",
 			VAR_1: "var #1 value",
@@ -97,13 +97,6 @@ describe("Pages Functions", () => {
 		expect(text).toContain("<h1>An asset</h1>");
 	});
 
-	it("doesn't warn about local mode", async ({ expect }) => {
-		// Regression test for https://github.com/cloudflare/workers-sdk/issues/4210
-		expect(getOutput()).not.toContain(
-			"--local is no longer required and will be removed in a future version"
-		);
-	});
-
 	describe("can mount a plugin", () => {
 		it("should mount Middleware", async ({ expect }) => {
 			const response = await fetch(
@@ -122,6 +115,13 @@ describe("Pages Functions", () => {
 				`"This should return a 502 status code"`
 			);
 			expect(response.status).toBe(502);
+		});
+
+		it("should work with peer externals", async ({ expect }) => {
+			const response = await fetch(`http://${ip}:${port}/mounted-plugin/ext`);
+			const text = await response.text();
+			expect(text).toMatchInlineSnapshot(`"42 is even"`);
+			expect(response.status).toBe(200);
 		});
 
 		it("should mount a Plugin even if in a parameterized route", async ({

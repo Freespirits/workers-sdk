@@ -1,4 +1,6 @@
 import { existsSync, statSync } from "fs";
+import { spinner } from "@cloudflare/cli/interactive";
+import degit from "degit";
 import { mockSpinner } from "helpers/__tests__/mocks";
 import {
 	appendFile,
@@ -7,10 +9,15 @@ import {
 	writeFile,
 } from "helpers/files";
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { addWranglerToGitIgnore } from "../templates";
+import {
+	addWranglerToGitIgnore,
+	deriveCorrelatedArgs,
+	downloadRemoteTemplate,
+} from "../templates";
 import type { PathLike } from "fs";
-import type { C3Context } from "types";
+import type { C3Args, C3Context } from "types";
 
+vi.mock("degit");
 vi.mock("fs");
 vi.mock("helpers/files");
 vi.mock("@cloudflare/cli/interactive");
@@ -38,7 +45,7 @@ describe("addWranglerToGitIgnore", () => {
 			(file: string, content: string) => {
 				appendFileResults.file = file;
 				appendFileResults.content = content;
-			}
+			},
 		);
 	});
 
@@ -50,7 +57,7 @@ describe("addWranglerToGitIgnore", () => {
 				isDirectory() {
 					return path.endsWith(".git");
 				},
-			})
+			}),
 		);
 		vi.mocked(existsSync).mockReset();
 		vi.mocked(readFile).mockReset();
@@ -66,21 +73,24 @@ describe("addWranglerToGitIgnore", () => {
 			"my-project/.gitignore",
 			`
       node_modules
-      .vscode`
+      .vscode`,
 		);
 		addWranglerToGitIgnore({
 			project: { path: "my-project" },
 		} as unknown as C3Context);
 
 		expect(appendFileResults.file).toMatchInlineSnapshot(
-			`"my-project/.gitignore"`
+			`"my-project/.gitignore"`,
 		);
 		expect(appendFileResults.content).toMatchInlineSnapshot(`
 			"
 
 			# wrangler files
 			.wrangler
-			.dev.vars
+			.dev.vars*
+			!.dev.vars.example
+			.env*
+			!.env.example
 			"
 		`);
 	});
@@ -90,10 +100,13 @@ describe("addWranglerToGitIgnore", () => {
 			"my-project/.gitignore",
 			`
       node_modules
-      .dev.vars
+      .dev.vars*
+			!.dev.vars.example
+			.env*
+			!.env.example
       .vscode
       .wrangler
-    `
+    `,
 		);
 		addWranglerToGitIgnore({
 			project: { path: "my-project" },
@@ -109,9 +122,12 @@ describe("addWranglerToGitIgnore", () => {
 			`
       node_modules
       .wrangler # This is for wrangler
-      .dev.vars # this is for wrangler and getPlatformProxy
+      .dev.vars* # this is for wrangler and getPlatformProxy
+			!.dev.vars.example # more comments
+			.env* # even more
+			!.env.example # and a final one
       .vscode
-    `
+    `,
 		);
 		addWranglerToGitIgnore({
 			project: { path: "my-project" },
@@ -121,20 +137,76 @@ describe("addWranglerToGitIgnore", () => {
 		expect(appendFileResults.content).toBeUndefined();
 	});
 
-	test("should append to the gitignore file the missing wrangler files when some is already present (without including the section heading)", () => {
+	test("should append to the gitignore file the missing wrangler files when some are already present (should add the section heading if including .wrangler and some others)", () => {
 		mockGitIgnore(
 			"my-project/.gitignore",
 			`
       node_modules
-      .dev.vars
-      .vscode`
+      .dev.vars*
+      .vscode`,
 		);
 		addWranglerToGitIgnore({
 			project: { path: "my-project" },
 		} as unknown as C3Context);
 
 		expect(appendFileResults.file).toMatchInlineSnapshot(
-			`"my-project/.gitignore"`
+			`"my-project/.gitignore"`,
+		);
+		expect(appendFileResults.content).toMatchInlineSnapshot(`
+			"
+
+			# wrangler files
+			.wrangler
+			!.dev.vars.example
+			.env*
+			!.env.example
+			"
+		`);
+	});
+
+	test("should append to the gitignore file the missing wrangler files when some are already present (should not add the section heading if .wrangler already exists)", () => {
+		mockGitIgnore(
+			"my-project/.gitignore",
+			`
+      node_modules
+			.wrangler
+      .dev.vars*
+      .vscode`,
+		);
+		addWranglerToGitIgnore({
+			project: { path: "my-project" },
+		} as unknown as C3Context);
+
+		expect(appendFileResults.file).toMatchInlineSnapshot(
+			`"my-project/.gitignore"`,
+		);
+		expect(appendFileResults.content).toMatchInlineSnapshot(`
+			"
+
+			!.dev.vars.example
+			.env*
+			!.env.example
+			"
+		`);
+	});
+
+	test("should append to the gitignore file the missing wrangler files when some are already present (should not add the section heading if only adding .wrangler)", () => {
+		mockGitIgnore(
+			"my-project/.gitignore",
+			`
+      node_modules
+      .dev.vars*
+			!.dev.vars.example
+			.env*
+			!.env.example
+      .vscode`,
+		);
+		addWranglerToGitIgnore({
+			project: { path: "my-project" },
+		} as unknown as C3Context);
+
+		expect(appendFileResults.file).toMatchInlineSnapshot(
+			`"my-project/.gitignore"`,
 		);
 		expect(appendFileResults.content).toMatchInlineSnapshot(`
 			"
@@ -149,17 +221,20 @@ describe("addWranglerToGitIgnore", () => {
 			"my-project/.gitignore",
 			`
       node_modules
-      .dev.vars
+      .dev.vars*
+			!.dev.vars.example
+			.env*
+			!.env.example
       .vscode
 
-    `
+    `,
 		);
 		addWranglerToGitIgnore({
 			project: { path: "my-project" },
 		} as unknown as C3Context);
 
 		expect(appendFileResults.file).toMatchInlineSnapshot(
-			`"my-project/.gitignore"`
+			`"my-project/.gitignore"`,
 		);
 		expect(appendFileResults.content).toMatchInlineSnapshot(`
 			"
@@ -182,20 +257,23 @@ describe("addWranglerToGitIgnore", () => {
 
 		// writeFile wrote the (empty) gitignore file
 		expect(writeFileResults.file).toMatchInlineSnapshot(
-			`"my-project/.gitignore"`
+			`"my-project/.gitignore"`,
 		);
 		expect(writeFileResults.content).toMatchInlineSnapshot(`""`);
 
 		// and the correct lines were then added to it
 		expect(appendFileResults.file).toMatchInlineSnapshot(
-			`"my-project/.gitignore"`
+			`"my-project/.gitignore"`,
 		);
 		expect(appendFileResults.content).toMatchInlineSnapshot(`
 			"
 
 			# wrangler files
 			.wrangler
-			.dev.vars
+			.dev.vars*
+			!.dev.vars.example
+			.env*
+			!.env.example
 			"
 		`);
 	});
@@ -214,6 +292,34 @@ describe("addWranglerToGitIgnore", () => {
 		expect(writeFileResults.content).toBeUndefined();
 	});
 
+	test("should add the wildcard .dev.vars* entry even if a .dev.vars is already included", () => {
+		mockGitIgnore(
+			"my-project/.gitignore",
+			`
+      node_modules
+			.dev.vars
+      .vscode
+			`,
+		);
+		addWranglerToGitIgnore({
+			project: { path: "my-project" },
+		} as unknown as C3Context);
+
+		expect(appendFileResults.file).toMatchInlineSnapshot(
+			`"my-project/.gitignore"`,
+		);
+		expect(appendFileResults.content).toMatchInlineSnapshot(`
+			"
+			# wrangler files
+			.wrangler
+			.dev.vars*
+			!.dev.vars.example
+			.env*
+			!.env.example
+			"
+		`);
+	});
+
 	test("should not add the .wrangler entry if a .wrangler/ is already included)", () => {
 		mockGitIgnore(
 			"my-project/.gitignore",
@@ -221,28 +327,122 @@ describe("addWranglerToGitIgnore", () => {
       node_modules
       .wrangler/ # This is for wrangler
       .vscode
-    `
+    `,
 		);
 		addWranglerToGitIgnore({
 			project: { path: "my-project" },
 		} as unknown as C3Context);
 
 		expect(appendFileResults.file).toMatchInlineSnapshot(
-			`"my-project/.gitignore"`
+			`"my-project/.gitignore"`,
 		);
 		expect(appendFileResults.content).toMatchInlineSnapshot(`
 			"
-			.dev.vars
+			.dev.vars*
+			!.dev.vars.example
+			.env*
+			!.env.example
 			"
 		`);
 	});
 
 	function mockGitIgnore(path: string, content: string) {
 		vi.mocked(existsSync).mockImplementation(
-			(filePath: PathLike) => filePath === path
+			(filePath: PathLike) => filePath === path,
 		);
 		vi.mocked(readFile).mockImplementation((filePath: string) =>
-			filePath === path ? content.replace(/\n\s*/g, "\n") : ""
+			filePath === path ? content.replace(/\n\s*/g, "\n") : "",
 		);
 	}
+});
+
+describe("downloadRemoteTemplate", () => {
+	function mockDegit() {
+		// @ts-expect-error only clone will be used
+		return vi.mocked(degit).mockReturnValue({
+			clone: () => Promise.resolve(),
+		});
+	}
+
+	test("should download template using degit", async () => {
+		const mock = mockDegit();
+
+		await downloadRemoteTemplate("cloudflare/workers-sdk");
+
+		expect(mock).toBeCalled();
+	});
+
+	test("should not use a spinner", async () => {
+		// Degit runs `git clone` internally which might prompt for credentials
+		// A spinner will suppress the prompt and keep the CLI waiting in the cloning stage
+		mockDegit();
+
+		await downloadRemoteTemplate("cloudflare/workers-sdk");
+
+		expect(spinner).not.toBeCalled();
+	});
+
+	test("should call degit with a mode of undefined if not specified", async () => {
+		const mock = mockDegit();
+
+		await downloadRemoteTemplate("cloudflare/workers-sdk");
+
+		expect(mock).toBeCalledWith("cloudflare/workers-sdk", {
+			cache: false,
+			verbose: false,
+			force: true,
+			mode: undefined,
+		});
+	});
+
+	test("should call degit with a mode of 'git' if specified", async () => {
+		const mock = mockDegit();
+
+		await downloadRemoteTemplate("cloudflare/workers-sdk", "git");
+
+		expect(mock).toBeCalledWith("cloudflare/workers-sdk", {
+			cache: false,
+			verbose: false,
+			force: true,
+			mode: "git",
+		});
+	});
+});
+
+describe("deriveCorrelatedArgs", () => {
+	test("should derive the lang as TypeScript if `--ts` is specified", () => {
+		const args: Partial<C3Args> = {
+			ts: true,
+		};
+
+		deriveCorrelatedArgs(args);
+
+		expect(args.lang).toBe("ts");
+	});
+
+	test("should derive the lang as JavaScript if `--ts=false` is specified", () => {
+		const args: Partial<C3Args> = {
+			ts: false,
+		};
+
+		deriveCorrelatedArgs(args);
+
+		expect(args.lang).toBe("js");
+	});
+
+	test("should crash if both the lang and ts arguments are specified", () => {
+		expect(() =>
+			deriveCorrelatedArgs({
+				lang: "ts",
+			}),
+		).not.toThrow();
+		expect(() =>
+			deriveCorrelatedArgs({
+				ts: true,
+				lang: "ts",
+			}),
+		).toThrow(
+			"The `--ts` argument cannot be specified in conjunction with the `--lang` argument",
+		);
+	});
 });

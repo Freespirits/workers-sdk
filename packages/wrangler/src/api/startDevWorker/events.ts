@@ -1,12 +1,7 @@
-import type { CfDurableObject } from "../../deployment-bundle/worker";
-import type { EsbuildBundle } from "../../dev/use-esbuild";
 import type { DevToolsEvent } from "./devtools";
-import type { StartDevWorkerOptions } from "./types";
-import type { Miniflare } from "miniflare";
+import type { Bundle, StartDevWorkerOptions } from "./types";
+import type { Miniflare, WorkerRegistry } from "miniflare";
 
-export type TeardownEvent = {
-	type: "teardown";
-};
 export type ErrorEvent =
 	| BaseErrorEvent<
 			| "ConfigController"
@@ -15,12 +10,17 @@ export type ErrorEvent =
 			| "RemoteRuntimeController"
 			| "ProxyWorker"
 			| "InspectorProxyWorker"
+			| "MultiworkerRuntimeController"
 	  >
 	| BaseErrorEvent<
 			"ProxyController",
-			{ config?: StartDevWorkerOptions; bundle?: EsbuildBundle }
+			{ config?: StartDevWorkerOptions; bundle?: Bundle }
+	  >
+	| BaseErrorEvent<
+			"BundlerController",
+			{ config?: StartDevWorkerOptions; filePath?: string }
 	  >;
-export type BaseErrorEvent<Source = string, Data = undefined> = {
+type BaseErrorEvent<Source = string, Data = undefined> = {
 	type: "error";
 	reason: string;
 	cause: Error | SerializedError;
@@ -29,7 +29,9 @@ export type BaseErrorEvent<Source = string, Data = undefined> = {
 };
 
 export function castErrorCause(cause: unknown) {
-	if (cause instanceof Error) return cause;
+	if (cause instanceof Error) {
+		return cause;
+	}
 
 	const error = new Error();
 	error.cause = cause;
@@ -54,7 +56,7 @@ export type BundleCompleteEvent = {
 	type: "bundleComplete";
 
 	config: StartDevWorkerOptions;
-	bundle: EsbuildBundle;
+	bundle: Bundle;
 };
 
 // RuntimeController
@@ -62,14 +64,19 @@ export type ReloadStartEvent = {
 	type: "reloadStart";
 
 	config: StartDevWorkerOptions;
-	bundle: EsbuildBundle;
+	bundle: Bundle;
 };
 export type ReloadCompleteEvent = {
 	type: "reloadComplete";
 
 	config: StartDevWorkerOptions;
-	bundle: EsbuildBundle;
+	bundle: Bundle;
 	proxyData: ProxyData;
+};
+export type DevRegistryUpdateEvent = {
+	type: "devRegistryUpdate";
+
+	registry: WorkerRegistry;
 };
 
 // ProxyController
@@ -81,8 +88,9 @@ export type PreviewTokenExpiredEvent = {
 };
 export type ReadyEvent = {
 	type: "ready";
-
 	proxyWorker: Miniflare;
+	url: URL;
+	inspectorUrl: URL | undefined;
 };
 
 // ProxyWorker
@@ -143,10 +151,9 @@ export type UrlOriginAndPathnameParts = Pick<
 
 export type ProxyData = {
 	userWorkerUrl: UrlOriginParts;
-	userWorkerInspectorUrl: UrlOriginAndPathnameParts;
-	userWorkerInnerUrlOverrides: Partial<UrlOriginParts>;
+	userWorkerInspectorUrl?: UrlOriginAndPathnameParts;
+	userWorkerInnerUrlOverrides?: Partial<UrlOriginParts>;
 	headers: Record<string, string>;
 	liveReload?: boolean;
 	proxyLogsToController?: boolean;
-	internalDurableObjects?: CfDurableObject[];
 };

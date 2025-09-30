@@ -1,12 +1,13 @@
 module.exports = {
 	root: true,
-	extends: ["@cloudflare/eslint-config-worker"],
+	extends: ["plugin:turbo/recommended", "@cloudflare/eslint-config-shared"],
 	ignorePatterns: [
 		"vendor",
 		"*-dist",
 		"pages/functions/template-worker.ts",
 		"templates",
 		"emitted-types",
+		"kv-asset-handler.js",
 	],
 	overrides: [
 		{
@@ -19,6 +20,7 @@ module.exports = {
 				project: true,
 			},
 			rules: {
+				"no-console": "error",
 				"no-restricted-globals": [
 					"error",
 					{

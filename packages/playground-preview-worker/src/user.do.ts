@@ -46,11 +46,13 @@ export class UserSession {
 	previewToken: string | undefined;
 	inspectorUrl: string | undefined;
 	workerName!: string;
-	constructor(private state: DurableObjectState, private env: Env) {
+	constructor(
+		private state: DurableObjectState,
+		private env: Env
+	) {
 		void this.state.blockConcurrencyWhile(async () => {
-			this.config = await this.state.storage.get<RealishPreviewConfig>(
-				"config"
-			);
+			this.config =
+				await this.state.storage.get<RealishPreviewConfig>("config");
 			let workerName = await this.state.storage.get<string>("workerName");
 			if (!workerName) {
 				workerName = crypto.randomUUID();
@@ -85,7 +87,7 @@ export class UserSession {
 				name,
 				worker
 			);
-		} catch (e) {
+		} catch {
 			// Try to recover _once_ from failure. This captures expired tokens, but means that genuine failures won't cause
 			// a request loop and will return an error to the user
 			await this.refreshTokens();
@@ -166,7 +168,7 @@ export class UserSession {
 			throw new BadUpload(`Expected valid form data`, String(e));
 		}
 
-		const m = worker.get("metadata");
+		const m = worker.get("metadata") as unknown;
 		if (!(m instanceof File)) {
 			throw new BadUpload("Expected metadata file to be defined");
 		}

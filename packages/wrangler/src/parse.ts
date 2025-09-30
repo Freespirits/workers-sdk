@@ -2,9 +2,10 @@ import * as fs from "node:fs";
 import { resolve } from "node:path";
 import TOML from "@iarna/toml";
 import { formatMessagesSync } from "esbuild";
-import { parse as jsoncParse, printParseErrorCode } from "jsonc-parser";
+import * as jsoncParser from "jsonc-parser";
 import { UserError } from "./errors";
 import { logger } from "./logger";
+import type { TelemetryMessage } from "./errors";
 import type { ParseError as JsoncParseError } from "jsonc-parser";
 
 export type Message = {
@@ -12,7 +13,7 @@ export type Message = {
 	location?: Location;
 	notes?: Message[];
 	kind?: "warning" | "error";
-};
+} & TelemetryMessage;
 
 export type Location = File & {
 	line: number;
@@ -56,8 +57,8 @@ export class ParseError extends UserError implements Message {
 	readonly location?: Location;
 	readonly kind: "warning" | "error";
 
-	constructor({ text, notes, location, kind }: Message) {
-		super(text);
+	constructor({ text, notes, location, kind, telemetryMessage }: Message) {
+		super(text, { telemetryMessage });
 		this.name = this.constructor.name;
 		this.text = text;
 		this.notes = notes ?? [];
@@ -71,6 +72,27 @@ export class ParseError extends UserError implements Message {
 // In particular, API errors which we'd like to report are `ParseError`s.
 // Therefore, allow particular `ParseError`s to be marked `reportable`.
 export class APIError extends ParseError {
+	#status?: number;
+	code?: number;
+	accountTag?: string;
+
+	constructor({ status, ...rest }: Message & { status?: number }) {
+		super(rest);
+		this.name = this.constructor.name;
+		this.#status = status;
+	}
+
+	isGatewayError() {
+		if (this.#status !== undefined) {
+			return [524].includes(this.#status);
+		}
+		return false;
+	}
+
+	isRetryable() {
+		return String(this.#status).startsWith("5");
+	}
+
 	// Allow `APIError`s to be marked as handled.
 	#reportable = true;
 	get reportable() {
@@ -111,11 +133,13 @@ export function parseTOML(input: string, file?: string): TOML.JsonMap | never {
 			file,
 			fileText: input,
 		};
-		throw new ParseError({ text, location });
+		throw new ParseError({
+			text,
+			location,
+			telemetryMessage: "TOML parse error",
+		});
 	}
 }
-
-const JSON_ERROR_SUFFIX = " in JSON at position ";
 
 /**
  * A minimal type describing a package.json file.
@@ -129,47 +153,39 @@ export type PackageJSON = {
 /**
  * A typed version of `parseJSON()`.
  */
-export function parsePackageJSON<T extends PackageJSON = PackageJSON>(
-	input: string,
-	file?: string
-): T {
-	return parseJSON<T>(input, file);
+export function parsePackageJSON(input: string, file?: string): PackageJSON {
+	return parseJSON(input, file) as PackageJSON;
 }
 
 /**
- * A wrapper around `JSON.parse` that throws a `ParseError`.
+ * Parses JSON and throws a `ParseError`.
  */
-export function parseJSON<T>(input: string, file?: string): T {
-	try {
-		return JSON.parse(input);
-	} catch (err) {
-		const { message } = err as Error;
-		const index = message.lastIndexOf(JSON_ERROR_SUFFIX);
-		if (index < 0) {
-			throw err;
-		}
-		const text = message.substring(0, index);
-		const position = parseInt(
-			message.substring(index + JSON_ERROR_SUFFIX.length)
-		);
-		const location = indexLocation({ file, fileText: input }, position);
-		throw new ParseError({ text, location });
-	}
+export function parseJSON(input: string, file?: string): unknown {
+	return parseJSONC(input, file, {
+		allowEmptyContent: false,
+		allowTrailingComma: false,
+		disallowComments: true,
+	});
 }
 
 /**
  * A wrapper around `JSONC.parse` that throws a `ParseError`.
  */
-export function parseJSONC<T>(input: string, file?: string): T {
+export function parseJSONC(
+	input: string,
+	file?: string,
+	options: jsoncParser.ParseOptions = { allowTrailingComma: true }
+): unknown {
 	const errors: JsoncParseError[] = [];
-	const data = jsoncParse(input, errors);
+	const data = jsoncParser.parse(input, errors, options);
 	if (errors.length) {
 		throw new ParseError({
-			text: printParseErrorCode(errors[0].error),
+			text: jsoncParser.printParseErrorCode(errors[0].error),
 			location: {
 				...indexLocation({ file, fileText: input }, errors[0].offset + 1),
 				length: errors[0].length,
 			},
+			telemetryMessage: "JSON(C) parse error",
 		});
 	}
 	return data;
@@ -199,8 +215,13 @@ export function readFileSyncToBuffer(file: string): Buffer {
  */
 export function readFileSync(file: string): string {
 	try {
-		return fs.readFileSync(file, { encoding: "utf-8" });
+		const buffer = fs.readFileSync(file);
+		return removeBOMAndValidate(buffer, file);
 	} catch (err) {
+		if (err instanceof ParseError) {
+			throw err;
+		}
+
 		const { message } = err as Error;
 		throw new ParseError({
 			text: `Could not read file: ${file}`,
@@ -209,6 +230,7 @@ export function readFileSync(file: string): string {
 					text: message.replace(file, resolve(file)),
 				},
 			],
+			telemetryMessage: "Could not read file",
 		});
 	}
 }
@@ -319,4 +341,118 @@ export function parseHumanDuration(s: string): number {
 		}
 	}
 	return Number(s) * base;
+}
+
+export function parseNonHyphenedUuid(uuid: string | null): string | null {
+	if (uuid == null || uuid.includes("-")) {
+		return uuid;
+	}
+
+	if (uuid.length != 32) {
+		return null;
+	}
+
+	const uuid_parts: string[] = [];
+	uuid_parts.push(uuid.slice(0, 8));
+	uuid_parts.push(uuid.slice(8, 12));
+	uuid_parts.push(uuid.slice(12, 16));
+	uuid_parts.push(uuid.slice(16, 20));
+	uuid_parts.push(uuid.slice(20));
+
+	let hyphenated = "";
+	uuid_parts.forEach((part) => (hyphenated += part + "-"));
+
+	return hyphenated.slice(0, 36);
+}
+
+export function parseByteSize(
+	s: string,
+	base: number | undefined = undefined
+): number {
+	const match = s.match(
+		/^(\d*\.*\d*)\s*([kKmMgGtTpP]{0,1})([i]{0,1}[bB]{0,1})$/
+	);
+	if (!match) {
+		return NaN;
+	}
+
+	const size = match[1];
+	if (size.length === 0 || isNaN(Number(size))) {
+		return NaN;
+	}
+
+	const unit = match[2].toLowerCase();
+	const sizeUnits = {
+		k: 1,
+		m: 2,
+		g: 3,
+		t: 4,
+		p: 5,
+	} as const;
+	if (unit.length !== 0 && !(unit in sizeUnits)) {
+		return NaN;
+	}
+
+	const binary = match[3].toLowerCase() == "ib";
+	if (binary && unit.length === 0) {
+		// Plain "ib" without a size unit is invalid
+		return NaN;
+	}
+
+	const pow = sizeUnits[unit as keyof typeof sizeUnits] || 0;
+
+	return Math.floor(
+		Number(size) * Math.pow(base ?? (binary ? 1024 : 1000), pow)
+	);
+}
+
+const UNSUPPORTED_BOMS = [
+	{
+		buffer: Buffer.from([0x00, 0x00, 0xfe, 0xff]),
+		encoding: "UTF-32 BE",
+	},
+	{
+		buffer: Buffer.from([0xff, 0xfe, 0x00, 0x00]),
+		encoding: "UTF-32 LE",
+	},
+	{
+		buffer: Buffer.from([0xfe, 0xff]),
+		encoding: "UTF-16 BE",
+	},
+	{
+		buffer: Buffer.from([0xff, 0xfe]),
+		encoding: "UTF-16 LE",
+	},
+];
+
+/**
+ * Removes UTF-8 BOM if present and validates that no other BOMs are present.
+ * Throws ParseError for non-UTF-8 BOMs with descriptive error messages.
+ */
+function removeBOMAndValidate(buffer: Buffer, file: string): string {
+	for (const bom of UNSUPPORTED_BOMS) {
+		if (
+			buffer.length >= bom.buffer.length &&
+			buffer.subarray(0, bom.buffer.length).equals(bom.buffer)
+		) {
+			throw new ParseError({
+				text: `Configuration file contains ${bom.encoding} byte order marker`,
+				notes: [
+					{
+						text: `The file "${file}" appears to be encoded as ${bom.encoding}. Please save the file as UTF-8 without BOM.`,
+					},
+				],
+				location: { file, line: 1, column: 0 },
+				telemetryMessage: `${bom.encoding} BOM detected`,
+			});
+		}
+	}
+
+	const content = buffer.toString("utf-8");
+
+	if (content.charCodeAt(0) === 0xfeff) {
+		return content.slice(1);
+	}
+
+	return content;
 }

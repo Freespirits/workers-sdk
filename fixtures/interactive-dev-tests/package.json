@@ -1,16 +1,20 @@
 {
-	"name": "interactive-dev-tests",
+	"name": "@fixture/interactive-dev",
 	"private": true,
 	"scripts": {
-		"test": "vitest run",
 		"test:ci": "vitest run",
 		"test:watch": "vitest"
 	},
 	"devDependencies": {
+		"@fixture/shared": "workspace:*",
 		"strip-ansi": "^7.1.0",
-		"undici": "^5.28.3"
+		"undici": "catalog:default",
+		"vitest": "catalog:default"
 	},
 	"optionalDependencies": {
-		"node-pty": "^1.0.0"
+		"@cdktf/node-pty-prebuilt-multiarch": "0.10.2"
+	},
+	"volta": {
+		"extends": "../../package.json"
 	}
 }

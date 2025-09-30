@@ -2,19 +2,19 @@ import assert from "node:assert";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createMetadataObject } from "@cloudflare/pages-shared/metadata-generator/createMetadataObject";
-import { parseHeaders } from "@cloudflare/pages-shared/metadata-generator/parseHeaders";
-import { parseRedirects } from "@cloudflare/pages-shared/metadata-generator/parseRedirects";
+import { parseHeaders, parseRedirects } from "@cloudflare/workers-shared";
 import { watch } from "chokidar";
 import { getType } from "mime";
 import { fetch, Request, Response } from "miniflare";
 import { Dispatcher, getGlobalDispatcher } from "undici";
+import { logger } from "../logger";
 import { hashFile } from "../pages/hash";
 import type { Logger } from "../logger";
 import type { Metadata } from "@cloudflare/pages-shared/asset-server/metadata";
 import type {
 	ParsedHeaders,
 	ParsedRedirects,
-} from "@cloudflare/pages-shared/metadata-generator/types";
+} from "@cloudflare/workers-shared";
 import type { Request as WorkersRequest } from "@cloudflare/workers-types/experimental";
 import type { RequestInit } from "miniflare";
 import type { IncomingHttpHeaders } from "undici/types/header";
@@ -167,6 +167,8 @@ async function generateAssetsFetch(
 	let metadata = createMetadataObject({
 		redirects,
 		headers,
+		headersFile,
+		redirectsFile,
 		logger: log,
 	});
 
@@ -191,6 +193,8 @@ async function generateAssetsFetch(
 			metadata = createMetadataObject({
 				redirects,
 				headers,
+				redirectsFile,
+				headersFile,
 				logger: log,
 			});
 		}
@@ -203,7 +207,8 @@ async function generateAssetsFetch(
 			request: request as unknown as WorkersRequest,
 			metadata: metadata as Metadata,
 			xServerEnvHeader: "dev",
-			logError: console.error,
+			xWebAnalyticsHeader: false,
+			logError: logger.error,
 			findAssetEntryForPath: async (path) => {
 				const filepath = resolve(join(directory, path));
 				if (!filepath.startsWith(directory)) {

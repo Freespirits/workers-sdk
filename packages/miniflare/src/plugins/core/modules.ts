@@ -6,12 +6,13 @@ import { pathToFileURL } from "url";
 import { TextDecoder, TextEncoder } from "util";
 import { parse } from "acorn";
 import { simple } from "acorn-walk";
-import type estree from "estree";
 import { dim } from "kleur/colors";
 import { z } from "zod";
 import { Worker_Module } from "../../runtime";
-import { MiniflareCoreError, PathSchema, globsToRegExps } from "../../shared";
+import { globsToRegExps, MiniflareCoreError, PathSchema } from "../../shared";
 import { MatcherRegExps, testRegExps } from "../../workers";
+import { getNodeCompat, NodeJSCompatMode } from "./node-compat";
+import type estree from "estree";
 
 const SUGGEST_BUNDLE =
 	"If you're trying to import an npm package, you'll need to bundle your Worker first.";
@@ -20,7 +21,7 @@ const SUGGEST_NODE =
 	"that uses Node.js built-ins, you'll either need to:" +
 	"\n- Bundle your Worker, configuring your bundler to polyfill Node.js built-ins" +
 	"\n- Configure your bundler to load Workers-compatible builds by changing the main fields/conditions" +
-	"\n- Enable the `nodejs_compat` compatibility flag and use the `NodeJsCompatModule` module type" +
+	"\n- Enable the `nodejs_compat` compatibility flag" +
 	"\n- Find an alternative package that doesn't require Node.js built-ins";
 
 const builtinModulesWithPrefix = builtinModules.concat(
@@ -29,9 +30,9 @@ const builtinModulesWithPrefix = builtinModules.concat(
 
 // Module identifier used if script came from `script` option
 export function buildStringScriptPath(workerIndex: number) {
-	return `script:${workerIndex}`;
+	return `script-${workerIndex}`;
 }
-const stringScriptRegexp = /^script:(\d+)$/;
+const stringScriptRegexp = /^script-(\d+)$/;
 export function maybeGetStringScriptPathIndex(
 	scriptPath: string
 ): number | undefined {
@@ -42,7 +43,6 @@ export function maybeGetStringScriptPathIndex(
 export const ModuleRuleTypeSchema = z.enum([
 	"ESModule",
 	"CommonJS",
-	"NodeJsCompatModule",
 	"Text",
 	"Data",
 	"CompiledWasm",
@@ -51,7 +51,7 @@ export const ModuleRuleTypeSchema = z.enum([
 ]);
 export type ModuleRuleType = z.infer<typeof ModuleRuleTypeSchema>;
 
-type JavaScriptModuleRuleType = "ESModule" | "CommonJS" | "NodeJsCompatModule";
+type JavaScriptModuleRuleType = "ESModule" | "CommonJS";
 
 export const ModuleRuleSchema = z.object({
 	type: ModuleRuleTypeSchema,
@@ -156,7 +156,7 @@ function getResolveErrorPrefix(referencingPath: string): string {
 
 export class ModuleLocator {
 	readonly #compiledRules: CompiledModuleRule[];
-	readonly #nodejsCompat: boolean;
+	readonly #nodejsCompatMode: NodeJSCompatMode;
 	readonly #visitedPaths = new Set<string>();
 	readonly modules: Worker_Module[] = [];
 
@@ -164,15 +164,16 @@ export class ModuleLocator {
 		private readonly modulesRoot: string,
 		private readonly additionalModuleNames: string[],
 		rules: ModuleRule[] = [],
+		compatibilityDate?: string,
 		compatibilityFlags?: string[]
 	) {
 		// Implicit shallow-copy to avoid mutating argument
 		rules = rules.concat(DEFAULT_MODULE_RULES);
 		this.#compiledRules = compileModuleRules(rules);
-		// `nodejs_compat` doesn't have a default-on date, so we know whether it's
-		// enabled just by looking at flags:
-		// https://github.com/cloudflare/workerd/blob/edcd0300bc7b8f56040d090177db947edd22f91b/src/workerd/io/compatibility-date.capnp#L237-L240
-		this.#nodejsCompat = compatibilityFlags?.includes("nodejs_compat") ?? false;
+		this.#nodejsCompatMode = getNodeCompat(
+			compatibilityDate,
+			compatibilityFlags ?? []
+		).mode;
 	}
 
 	visitEntrypoint(code: string, modulePath: string) {
@@ -246,7 +247,7 @@ export class ModuleLocator {
 						) {
 							this.#visitModule(modulePath, name, type, argument);
 						}
-				  },
+					},
 		};
 		simple(root, visitors as Record<string, (node: any) => void>);
 	}
@@ -257,14 +258,6 @@ export class ModuleLocator {
 		referencingType: JavaScriptModuleRuleType,
 		specExpression: estree.Expression | estree.SpreadElement
 	) {
-		if (maybeGetStringScriptPathIndex(referencingName) !== undefined) {
-			const prefix = getResolveErrorPrefix(referencingPath);
-			throw new MiniflareCoreError(
-				"ERR_MODULE_STRING_SCRIPT",
-				`${prefix}: imports are unsupported in string \`script\` without defined \`scriptPath\``
-			);
-		}
-
 		// Ensure spec is a static string literal, and resolve full module identifier
 		if (
 			specExpression.type !== "Literal" ||
@@ -297,17 +290,31 @@ ${dim(modulesConfig)}`;
 		}
 		const spec = specExpression.value;
 
-		// `node:` (assuming `nodejs_compat` flag enabled), `cloudflare:` and
-		// `workerd:` imports don't need to be included explicitly
-		const isNodeJsCompatModule = referencingType === "NodeJsCompatModule";
 		if (
-			(this.#nodejsCompat && spec.startsWith("node:")) ||
+			// `cloudflare:` and `workerd:` imports don't need to be included explicitly
 			spec.startsWith("cloudflare:") ||
 			spec.startsWith("workerd:") ||
-			(isNodeJsCompatModule && builtinModulesWithPrefix.includes(spec)) ||
+			// Node.js compat v1 requires imports to be prefixed with `node:`
+			(this.#nodejsCompatMode === "v1" && spec.startsWith("node:")) ||
+			// Node.js compat modules and v2 can also handle non-prefixed imports
+			(this.#nodejsCompatMode === "v2" &&
+				builtinModulesWithPrefix.includes(spec)) ||
+			// Async Local Storage mode (node_als) only deals with `node:async_hooks` imports
+			(this.#nodejsCompatMode === "als" && spec === "node:async_hooks") ||
+			// Any "additional" external modules can be ignored
 			this.additionalModuleNames.includes(spec)
 		) {
 			return;
+		}
+
+		// If this isn't a built-in module, and this is a string script without
+		// a path, we won't be able to resolve it
+		if (maybeGetStringScriptPathIndex(referencingName) !== undefined) {
+			const prefix = getResolveErrorPrefix(referencingPath);
+			throw new MiniflareCoreError(
+				"ERR_MODULE_STRING_SCRIPT",
+				`${prefix}: imports are unsupported in string \`script\` without defined \`scriptPath\``
+			);
 		}
 
 		const identifier = path.resolve(path.dirname(referencingPath), spec);
@@ -336,7 +343,6 @@ ${dim(modulesConfig)}`;
 		switch (rule.type) {
 			case "ESModule":
 			case "CommonJS":
-			case "NodeJsCompatModule":
 				const code = data.toString("utf8");
 				this.#visitJavaScriptModule(code, identifier, rule.type);
 				break;
@@ -374,8 +380,6 @@ function createJavaScriptModule(
 		return { name, esModule: code };
 	} else if (type === "CommonJS") {
 		return { name, commonJsModule: code };
-	} else if (type === "NodeJsCompatModule") {
-		return { name, nodeJsCompatModule: code };
 	}
 	// noinspection UnnecessaryLocalVariableJS
 	const exhaustive: never = type;
@@ -400,7 +404,6 @@ export function convertModuleDefinition(
 	switch (def.type) {
 		case "ESModule":
 		case "CommonJS":
-		case "NodeJsCompatModule":
 			return createJavaScriptModule(
 				contentsToString(contents),
 				name,
@@ -432,8 +435,6 @@ function convertWorkerModule(mod: Worker_Module): ModuleDefinition {
 
 	if ("esModule" in m) return { path, type: "ESModule" };
 	else if ("commonJsModule" in m) return { path, type: "CommonJS" };
-	else if ("nodeJsCompatModule" in m)
-		return { path, type: "NodeJsCompatModule" };
 	else if ("text" in m) return { path, type: "Text" };
 	else if ("data" in m) return { path, type: "Data" };
 	else if ("wasm" in m) return { path, type: "CompiledWasm" };

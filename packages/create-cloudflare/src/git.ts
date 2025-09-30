@@ -1,8 +1,9 @@
+import assert from "node:assert";
 import { updateStatus } from "@cloudflare/cli";
-import { processArgument } from "@cloudflare/cli/args";
 import { brandColor, dim } from "@cloudflare/cli/colors";
 import { spinner } from "@cloudflare/cli/interactive";
 import { getFrameworkCli } from "frameworks/index";
+import { processArgument } from "helpers/args";
 import { C3_DEFAULTS } from "helpers/cli";
 import { runCommand } from "helpers/command";
 import { detectPackageManager } from "helpers/packageManagers";
@@ -16,7 +17,7 @@ export const offerGit = async (ctx: C3Context) => {
 		// haven't prompted yet, if provided as --git arg
 		if (ctx.args.git) {
 			updateStatus(
-				"Couldn't find `git` installed on your machine. Continuing without git."
+				"Couldn't find `git` installed on your machine. Continuing without git.",
 			);
 		}
 
@@ -26,51 +27,54 @@ export const offerGit = async (ctx: C3Context) => {
 		return; // bail early
 	}
 
-	const gitConfigured = await isGitConfigured();
-	if (!gitConfigured) {
-		// haven't prompted yet, if provided as --git arg
-		if (ctx.args.git) {
-			updateStatus(
-				"Must configure `user.name` and user.email` to use git. Continuing without git."
-			);
-		}
-
-		// override true (--git flag) and undefined (not prompted yet) to false (don't use git)
-		ctx.args.git = false;
-
-		return; // bail early
-	}
-
-	const insideGitRepo = await isInsideGitRepo(ctx.project.path);
-
-	if (insideGitRepo) return;
-
-	ctx.args.git = await processArgument(ctx.args, "git", {
+	ctx.args.git ??= await processArgument(ctx.args, "git", {
 		type: "confirm",
-		question: "Do you want to use git for version control?",
+		question: ctx.gitRepoAlreadyExisted
+			? "You're in an existing git repository. Do you want to use git for version control?"
+			: "Do you want to use git for version control?",
 		label: "git",
 		defaultValue: C3_DEFAULTS.git,
 	});
 
-	if (ctx.args.git) {
+	if (!ctx.args.git) {
+		return;
+	}
+
+	const gitConfigured = await isGitConfigured();
+	if (!gitConfigured) {
+		updateStatus(
+			"Must configure `user.name` and user.email` to use git. Continuing without git.",
+		);
+
+		// override ctx.args.git to false (don't use git)
+		ctx.args.git = false;
+		return;
+	}
+
+	// Only initialize git if we're not in an existing git repository
+	if (!ctx.gitRepoAlreadyExisted) {
 		await initializeGit(ctx.project.path);
 	}
 };
 
 export const gitCommit = async (ctx: C3Context) => {
+	assert.notStrictEqual(
+		ctx.args.git,
+		undefined,
+		"Expected git context to be defined by now",
+	);
 	// Note: createCommitMessage stores the message in ctx so that it can
 	//       be used later even if we're not in a git repository, that's why
 	//       we unconditionally run this command here
-	const commitMessage = await createCommitMessage(ctx);
+	ctx.commitMessage = await createCommitMessage(ctx);
+
+	if (!ctx.args.git) {
+		return;
+	}
 
 	// if a git repo existed before the process started then we don't want to commit
 	// we only commit if the git repo was initialized (directly or not) by c3
-	if (ctx.gitRepoAlreadyExisted) return;
-
-	const gitInstalled = await isGitInstalled();
-	const gitInitialized = await isInsideGitRepo(ctx.project.path);
-
-	if (!gitInstalled || !gitInitialized) {
+	if (ctx.gitRepoAlreadyExisted) {
 		return;
 	}
 
@@ -82,7 +86,7 @@ export const gitCommit = async (ctx: C3Context) => {
 		cwd: ctx.project.path,
 	});
 
-	await runCommand(["git", "commit", "-m", commitMessage], {
+	await runCommand(["git", "commit", "-m", ctx.commitMessage], {
 		silent: true,
 		cwd: ctx.project.path,
 	});
@@ -91,24 +95,21 @@ export const gitCommit = async (ctx: C3Context) => {
 };
 
 const createCommitMessage = async (ctx: C3Context) => {
-	const isPages = ctx.template.platform === "pages";
+	const framework = ctx.template.frameworkCli;
 
-	const header = isPages
+	const header = framework
 		? "Initialize web application via create-cloudflare CLI"
 		: "Initial commit (by create-cloudflare CLI)";
 
 	const packageManager = detectPackageManager();
 
 	const gitVersion = await getGitVersion();
-	const insideRepo = await isInsideGitRepo(ctx.project.path);
-
-	const showFramework = isPages || ctx.template.id === "hono";
 
 	const details = [
 		{ key: "C3", value: `create-cloudflare@${version}` },
 		{ key: "project name", value: ctx.project.name },
-		...(showFramework ? [{ key: "framework", value: ctx.template.id }] : []),
-		...(showFramework
+		...(framework ? [{ key: "framework", value: ctx.template.id }] : []),
+		...(framework
 			? [{ key: "framework cli", value: getFrameworkCli(ctx) }]
 			: []),
 		{
@@ -121,7 +122,7 @@ const createCommitMessage = async (ctx: C3Context) => {
 		},
 		{
 			key: "git",
-			value: insideRepo ? gitVersion : "N/A",
+			value: gitVersion ?? "N/A",
 		},
 	];
 
@@ -130,8 +131,6 @@ const createCommitMessage = async (ctx: C3Context) => {
 		.join("\n")}\n`;
 
 	const commitMessage = `${header}\n\n${body}\n`;
-
-	ctx.commitMessage = commitMessage;
 
 	return commitMessage;
 };
@@ -166,13 +165,17 @@ export async function isGitConfigured() {
 			useSpinner: false,
 			silent: true,
 		});
-		if (!userName) return false;
+		if (!userName) {
+			return false;
+		}
 
 		const email = await runCommand(["git", "config", "user.email"], {
 			useSpinner: false,
 			silent: true,
 		});
-		if (!email) return false;
+		if (!email) {
+			return false;
+		}
 
 		return true;
 	} catch {
@@ -194,7 +197,7 @@ export async function isInsideGitRepo(cwd: string) {
 		});
 
 		return output.includes("not a git repository") === false;
-	} catch (err) {
+	} catch {
 		return false;
 	}
 }
@@ -213,13 +216,13 @@ export async function initializeGit(cwd: string) {
 		// Get the default init branch name
 		const defaultBranchName = await runCommand(
 			["git", "config", "--get", "init.defaultBranch"],
-			{ useSpinner: false, silent: true, cwd }
+			{ useSpinner: false, silent: true, cwd },
 		);
 
 		// Try to create the repository with the HEAD branch of defaultBranchName ?? `main`.
 		await runCommand(
 			["git", "init", "--initial-branch", defaultBranchName.trim() ?? "main"], // branch names can't contain spaces, so this is safe
-			{ useSpinner: false, silent: true, cwd }
+			{ useSpinner: false, silent: true, cwd },
 		);
 	} catch {
 		// Unable to create the repo with a HEAD branch name, so just fall back to the default.
@@ -238,11 +241,11 @@ export async function getProductionBranch(cwd: string) {
 				cwd,
 				useSpinner: false,
 				captureOutput: true,
-			}
+			},
 		);
 
 		return productionBranch.trim();
-	} catch (err) {}
+	} catch {}
 
 	return "main";
 }

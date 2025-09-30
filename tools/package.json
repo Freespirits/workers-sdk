@@ -1,16 +1,22 @@
 {
-	"name": "tools",
-	"description": "Tooling for this monorepo CI",
+	"name": "@cloudflare/tools",
 	"private": true,
+	"description": "Tooling for this monorepo CI",
 	"scripts": {
+		"check:lint": "eslint . --max-warnings=0",
 		"check:type": "tsc",
-		"test": "vitest run",
-		"check:lint": "eslint ."
+		"test:ci": "vitest run",
+		"test:file": "node -r esbuild-register test/run-test-file.ts"
 	},
 	"devDependencies": {
-		"@cloudflare/eslint-config-worker": "workspace:*",
+		"@cloudflare/eslint-config-shared": "workspace:*",
 		"@cloudflare/workers-tsconfig": "workspace:*",
-		"@typescript-eslint/eslint-plugin": "^5.55.0",
-		"@typescript-eslint/parser": "^5.55.0"
+		"@typescript-eslint/eslint-plugin": "catalog:default",
+		"@typescript-eslint/parser": "catalog:default",
+		"find-up": "^6.3.0",
+		"glob": "^11.0.3",
+		"ts-dedent": "^2.2.0",
+		"undici": "catalog:default",
+		"wrangler": "workspace:*"
 	}
 }

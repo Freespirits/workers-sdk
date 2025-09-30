@@ -1,11 +1,17 @@
-import * as ListCatalog from "./listCatalog";
-import type { CommonYargsArgv } from "../yargs-types";
+import { createNamespace } from "../core/create-command";
 
-export function ai(yargs: CommonYargsArgv) {
-	return yargs.command(
-		"models",
-		"List catalog models",
-		ListCatalog.options,
-		ListCatalog.handler
-	);
-}
+export const aiNamespace = createNamespace({
+	metadata: {
+		description: "🤖 Manage AI models",
+		status: "stable",
+		owner: "Product: AI",
+	},
+});
+
+export const aiFineTuneNamespace = createNamespace({
+	metadata: {
+		description: "Interact with finetune files",
+		status: "stable",
+		owner: "Product: AI",
+	},
+});

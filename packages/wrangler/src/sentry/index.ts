@@ -14,13 +14,15 @@ let sentryReportingAllowed = false;
 declare const SENTRY_DSN: string;
 
 /* Returns a Sentry transport for the Sentry proxy Worker. */
-export const makeSentry10Transport = (options: BaseTransportOptions) => {
+const makeSentry10Transport = (options: BaseTransportOptions) => {
 	let eventQueue: [string, RequestInit][] = [];
 
 	const transportSentry10 = async (request: TransportRequest) => {
-		/* Adds helpful properties to the request body before we send it to our
-    proxy Worker. These properties can be parsed out from the NDJSON in
-    `request.body`, but it's easier and safer to just attach them here. */
+		/**
+		 * Adds helpful properties to the request body before we send it to our
+		 * proxy Worker. These properties can be parsed out from the NDJSON in
+		 * `request.body`, but it's easier and safer to just attach them here.
+		 */
 		const sentryWorkerPayload = {
 			envelope: request.body,
 			url: options.url,
@@ -74,7 +76,7 @@ export const makeSentry10Transport = (options: BaseTransportOptions) => {
 				};
 			}
 		} catch (err) {
-			console.log(err);
+			logger.error(err);
 
 			return rejectedSyncPromise(err);
 		}
@@ -84,7 +86,6 @@ export const makeSentry10Transport = (options: BaseTransportOptions) => {
 };
 
 const disabledDefaultIntegrations = [
-	"Console", // Console logs may contain PII
 	"LocalVariables", // Local variables may contain tokens and PII
 	"Http", // Only captures method/URL/response status, but URL may contain PII
 	"Undici", // Same as "Http"
@@ -105,16 +106,23 @@ export function setupSentry() {
 			beforeSend(event) {
 				delete event.server_name; // Computer name may contain PII
 				// Culture contains timezone and locale
-				if (event.contexts !== undefined) delete event.contexts.culture;
+				if (event.contexts !== undefined) {
+					delete event.contexts.culture;
+				}
 
 				// Rewrite Wrangler install location which may contain PII
 				const fakeInstallPath =
 					process.platform === "win32" ? "C:\\Project\\" : "/project/";
 				for (const exception of event.exception?.values ?? []) {
 					for (const frame of exception.stacktrace?.frames ?? []) {
-						if (frame.filename === undefined) continue;
+						if (frame.filename === undefined) {
+							continue;
+						}
 						const nodeModulesIndex = frame.filename.indexOf("node_modules");
-						if (nodeModulesIndex === -1) continue;
+
+						if (nodeModulesIndex === -1) {
+							continue;
+						}
 						frame.filename =
 							fakeInstallPath + frame.filename.substring(nodeModulesIndex);
 					}
@@ -143,7 +151,7 @@ export function addBreadcrumb(
 export async function captureGlobalException(e: unknown) {
 	if (typeof SENTRY_DSN !== "undefined") {
 		sentryReportingAllowed = await confirm(
-			"Would you like to report this error to Cloudflare?",
+			"Would you like to report this error to Cloudflare? Wrangler's output and the error details will be shared with the Wrangler team to help us diagnose and fix the issue.",
 			{ fallbackValue: false }
 		);
 

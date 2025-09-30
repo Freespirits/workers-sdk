@@ -1,5 +1,8 @@
+import assert from "node:assert";
 import { fork } from "node:child_process";
+import events from "node:events";
 import path from "node:path";
+import treeKill from "tree-kill";
 
 export const wranglerEntryPath = path.resolve(
 	__dirname,
@@ -17,12 +20,21 @@ export const wranglerEntryPath = path.resolve(
 export async function runWranglerPagesDev(
 	cwd: string,
 	publicPath: string | undefined,
-	options: string[]
+	options: string[],
+	env?: NodeJS.ProcessEnv
 ) {
 	if (publicPath) {
-		return runLongLivedWrangler(["pages", "dev", publicPath, ...options], cwd);
+		return runLongLivedWrangler(
+			["pages", "dev", publicPath, "--ip=127.0.0.1", ...options],
+			cwd,
+			env
+		);
 	} else {
-		return runLongLivedWrangler(["pages", "dev", ...options], cwd);
+		return runLongLivedWrangler(
+			["pages", "dev", "--ip=127.0.0.1", ...options],
+			cwd,
+			env
+		);
 	}
 }
 
@@ -34,11 +46,19 @@ export async function runWranglerPagesDev(
  * - `ip` and `port` of the http-server hosting the pages project
  * - `stop()` function that will close down the server.
  */
-export async function runWranglerDev(cwd: string, options: string[]) {
-	return runLongLivedWrangler(["dev", ...options], cwd);
+export async function runWranglerDev(
+	cwd: string,
+	options: string[],
+	env?: NodeJS.ProcessEnv
+) {
+	return runLongLivedWrangler(["dev", "--ip=127.0.0.1", ...options], cwd, env);
 }
 
-async function runLongLivedWrangler(command: string[], cwd: string) {
+async function runLongLivedWrangler(
+	command: string[],
+	cwd: string,
+	env?: NodeJS.ProcessEnv
+) {
 	let settledReadyPromise = false;
 	let resolveReadyPromise: (value: { ip: string; port: number }) => void;
 	let rejectReadyPromise: (reason: unknown) => void;
@@ -51,6 +71,7 @@ async function runLongLivedWrangler(command: string[], cwd: string) {
 	const wranglerProcess = fork(wranglerEntryPath, command, {
 		stdio: [/*stdin*/ "ignore", /*stdout*/ "pipe", /*stderr*/ "pipe", "ipc"],
 		cwd,
+		env: { ...process.env, ...env, PWD: cwd },
 	}).on("message", (message) => {
 		if (settledReadyPromise) return;
 		settledReadyPromise = true;
@@ -60,10 +81,23 @@ async function runLongLivedWrangler(command: string[], cwd: string) {
 
 	const chunks: Buffer[] = [];
 	wranglerProcess.stdout?.on("data", (chunk) => {
+		if (process.env.WRANGLER_LOG === "debug") {
+			console.log(`[${command}]`, chunk.toString());
+		}
 		chunks.push(chunk);
 	});
 	wranglerProcess.stderr?.on("data", (chunk) => {
+		if (process.env.WRANGLER_LOG === "debug") {
+			console.log(`[${command}]`, chunk.toString());
+		}
 		chunks.push(chunk);
+	});
+	wranglerProcess.once("exit", (exitCode) => {
+		if (exitCode !== 0) {
+			rejectReadyPromise(
+				`Wrangler exited with error code: ${exitCode}\nOutput: ${getOutput()}`
+			);
+		}
 	});
 	const getOutput = () => Buffer.concat(chunks).toString();
 	const clearOutput = () => (chunks.length = 0);
@@ -79,18 +113,27 @@ async function runLongLivedWrangler(command: string[], cwd: string) {
 			separator,
 		].join("\n");
 		rejectReadyPromise(new Error(message));
-	}, 20_000);
+	}, 50_000);
 
 	async function stop() {
-		return new Promise((resolve, reject) => {
-			wranglerProcess.once("exit", (code) => {
-				if (!code) {
-					resolve(code);
-				} else {
-					reject(code);
+		return new Promise<void>((resolve) => {
+			assert(
+				wranglerProcess.pid,
+				`Command "${command.join(" ")}" had no process id`
+			);
+			treeKill(wranglerProcess.pid, (e) => {
+				if (e) {
+					console.error(
+						"Failed to kill command: " + command.join(" "),
+						wranglerProcess.pid,
+						e
+					);
 				}
+				// fallthrough to resolve() because either the process is already dead
+				// or don't have permission to kill it or some other reason?
+				// either way, there is nothing we can do and we don't want to fail the test because of this
+				resolve();
 			});
-			wranglerProcess.kill("SIGTERM");
 		});
 	}
 

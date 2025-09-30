@@ -12,12 +12,14 @@ export const CLEANUP = () => {
 };
 
 export function isUrl(maybeUrl?: string): maybeUrl is string {
-	if (!maybeUrl) return false;
+	if (!maybeUrl) {
+		return false;
+	}
 
 	try {
 		new URL(maybeUrl);
 		return true;
-	} catch (e) {
+	} catch {
 		return false;
 	}
 }
